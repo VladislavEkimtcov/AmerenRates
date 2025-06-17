@@ -49,7 +49,7 @@ if __name__ == "__main__":
             hour_int = int(item["hour"]) - 1
             if hour_int == datetime.now().hour:
                 time_label = f">{BOLD}{time_label}{RESET}<"
-            price = math.ceil(item["price"] * 1000) / 10  # round up to 1 decimal
+            price = round(item["price"] * 100, 1)
             price_colored = colorize_price(price, (lower_third * 100, upper_third * 100))
 
             if i < 12:

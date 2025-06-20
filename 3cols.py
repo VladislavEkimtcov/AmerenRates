@@ -1,8 +1,10 @@
 RATES_URL = "https://www.ameren.com/api/ameren/promotion/RtpHourlyPricesbyDate"
+CACHE_FILENAME = "cached_rates.json"
 
 import requests
+import os
+import json
 from datetime import datetime, timedelta
-import math
 from tabulate import tabulate
 
 # ANSI escape sequences for terminal colors
@@ -11,6 +13,7 @@ GREEN = '\033[92m'
 YELLOW = '\033[93m'
 RED = '\033[91m'
 RESET = '\033[0m'
+CENT = '¢'
 
 def hour_to_time(hour_str):
     hour = int(hour_str) - 1  # shift because "01" is 00:00
@@ -21,21 +24,38 @@ def colorize_price(price, thresholds, should_highlight=False):
     arrow_prefix = f">{BOLD}" if should_highlight else ""
     arrow_postfix = f"<" if should_highlight else ""
     if price <= thresholds[0]:
-        return f"{arrow_prefix}{GREEN}¢{price:.1f}{RESET}{arrow_postfix}"
+        return f"{arrow_prefix}{GREEN}{CENT}{price:.1f}{RESET}{arrow_postfix}"
     elif price <= thresholds[1]:
-        return f"{arrow_prefix}{YELLOW}¢{price:.1f}{RESET}{arrow_postfix}"
+        return f"{arrow_prefix}{YELLOW}{CENT}{price:.1f}{RESET}{arrow_postfix}"
     else:
-        return f"{arrow_prefix}{RED}¢{price:.1f}{RESET}{arrow_postfix}"
+        return f"{arrow_prefix}{RED}{CENT}{price:.1f}{RESET}{arrow_postfix}"
 
-if __name__ == "__main__":
-    today = datetime.now().date()
-    bodyDict = {
-        "SelectedDate": today.strftime("%Y-%m-%d")
-    }
 
-    response = requests.post(RATES_URL, json=bodyDict)
+def fetch_or_load_rates():
+    today_str = datetime.now().strftime("%Y-%m-%d")
+    # Try to read cache
+    if os.path.exists(CACHE_FILENAME):
+        with open(CACHE_FILENAME, "r") as f:
+            try:
+                cached = json.load(f)
+                if cached.get("date") == today_str:
+                    return cached.get("data")
+            except json.JSONDecodeError:
+                pass
+    # Fetch fresh data
+    response = requests.post(RATES_URL, json={"SelectedDate": today_str})
     if response.status_code == 200:
         data = response.json()
+        with open(CACHE_FILENAME, "w") as f:
+            json.dump({"date": today_str, "data": data}, f)
+        return data
+    else:
+        raise RuntimeError(f"Failed to fetch rates: {response.status_code} - {response.text}")
+
+
+if __name__ == "__main__":
+    try:
+        data = fetch_or_load_rates()
 
         all_prices = [item["price"] for item in data["hourlyPriceDetails"]]
         sorted_prices = sorted(all_prices)
@@ -50,10 +70,9 @@ if __name__ == "__main__":
             time_label = hour_to_time(item["hour"])
             hour_int = int(item["hour"]) - 1
             current_hour = datetime.now().hour
-            highlight_price = False
-            if hour_int == current_hour or hour_int + 12 == current_hour:
-                time_label = f">{BOLD}{datetime.now().hour : 02}:{datetime.now().minute:02}{RESET}<"
-                highlight_price = (hour_int == current_hour)
+            highlight_price = hour_int == current_hour
+            if highlight_price or hour_int + 12 == current_hour:
+                time_label = f">{BOLD}{datetime.now().hour:02}:{datetime.now().minute:02}{RESET}<"
             price = round(item["price"] * 100, 1)
             price_colored = colorize_price(price, (lower_third * 100, upper_third * 100), highlight_price)
 
@@ -68,5 +87,5 @@ if __name__ == "__main__":
 
         print(tabulate(table, headers=["Hour", "AM", "PM"], tablefmt="plain"))
 
-    else:
-        print(f"Error: {response.status_code} - {response.text}")
+    except Exception as e:
+        print(f"Error: {e}")

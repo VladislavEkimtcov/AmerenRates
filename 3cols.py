@@ -52,7 +52,7 @@ if __name__ == "__main__":
             current_hour = datetime.now().hour
             highlight_price = False
             if hour_int == current_hour or hour_int + 12 == current_hour:
-                time_label = f">{BOLD}{time_label}{RESET}<"
+                time_label = f">{BOLD}{datetime.now().hour : 02}:{datetime.now().minute:02}{RESET}<"
                 highlight_price = (hour_int == current_hour)
             price = round(item["price"] * 100, 1)
             price_colored = colorize_price(price, (lower_third * 100, upper_third * 100), highlight_price)

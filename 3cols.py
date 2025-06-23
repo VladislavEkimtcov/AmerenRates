@@ -1,5 +1,6 @@
 RATES_URL = "https://www.ameren.com/api/ameren/promotion/RtpHourlyPricesbyDate"
 CACHE_FILENAME = "cached_rates.json"
+HIGH_PRICE_THRESHOLD = 10
 
 import requests
 import os
@@ -21,14 +22,17 @@ def hour_to_time(hour_str):
     return time_obj
 
 def colorize_price(price, thresholds, should_highlight=False):
-    arrow_prefix = f">{BOLD}" if should_highlight else ""
-    arrow_postfix = f"<" if should_highlight else ""
-    if price <= thresholds[0]:
-        return f"{arrow_prefix}{GREEN}{CENT}{price:.1f}{RESET}{arrow_postfix}"
-    elif price <= thresholds[1]:
-        return f"{arrow_prefix}{YELLOW}{CENT}{price:.1f}{RESET}{arrow_postfix}"
+    if price > HIGH_PRICE_THRESHOLD or price > thresholds[1]:
+        color = RED
+    elif price <= thresholds[0]:
+        color = GREEN
     else:
-        return f"{arrow_prefix}{RED}{CENT}{price:.1f}{RESET}{arrow_postfix}"
+        color = YELLOW
+
+    prefix = f">{BOLD}" if should_highlight else ""
+    postfix = "<" if should_highlight else ""
+    return f"{prefix}{color}{CENT}{price:.1f}{RESET}{postfix}"
+
 
 
 def fetch_or_load_rates():

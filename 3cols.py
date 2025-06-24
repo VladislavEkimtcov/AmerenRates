@@ -21,8 +21,10 @@ def hour_to_time(hour_str):
     time_obj = (datetime.min + timedelta(hours=hour)).strftime("%-I:%M")
     return time_obj
 
-def colorize_price(price, thresholds, should_highlight=False):
-    if price > HIGH_PRICE_THRESHOLD or price > thresholds[1]:
+def colorize_price(price, thresholds, should_highlight=False, is_max=False):
+    if is_max:
+        color = RESET
+    elif price > HIGH_PRICE_THRESHOLD or price > thresholds[1]:
         color = RED
     elif price <= thresholds[0]:
         color = GREEN
@@ -78,7 +80,9 @@ if __name__ == "__main__":
             if highlight_price or hour_int + 12 == current_hour:
                 time_label = f">{BOLD}{datetime.now().hour:02}:{datetime.now().minute:02}{RESET}<"
             price = round(item["price"] * 100, 1)
-            price_colored = colorize_price(price, (lower_third * 100, upper_third * 100), highlight_price)
+            # todo set if the price is highest ofr the day
+            price_colored = colorize_price(price, (lower_third * 100, upper_third * 100), highlight_price,
+                                           is_max=(item["price"] == max(all_prices)))
 
             if i < 12:
                 first_half.append([time_label, price_colored])

@@ -5,8 +5,9 @@ HIGH_PRICE_THRESHOLD = 10
 import requests
 import os
 import json
-from datetime import datetime, timedelta
+from datetime import datetime
 from tabulate import tabulate
+from hour_utils import detect_hour_offset, normalize_hour, hour_to_time
 
 # ANSI escape sequences for terminal colors
 BOLD = '\033[1m'
@@ -15,12 +16,6 @@ YELLOW = '\033[93m'
 RED = '\033[91m'
 RESET = '\033[0m'
 CENT = '¢'
-
-def hour_to_time(hour_str):
-    # API now returns hours starting at "01" for 00:00 through "24" for 23:00
-    hour = int(hour_str) - 1  # shift because "01" is 00:00
-    time_obj = (datetime.min + timedelta(hours=hour)).strftime("%-I:%M")
-    return time_obj
 
 
 def colorize_price(price, thresholds, should_highlight=False, is_max=False):
@@ -36,7 +31,6 @@ def colorize_price(price, thresholds, should_highlight=False, is_max=False):
     prefix = f">{BOLD}" if should_highlight else ""
     postfix = "<" if should_highlight else ""
     return f"{prefix}{color}{CENT}{price:.1f}{RESET}{postfix}"
-
 
 
 def fetch_or_load_rates():
@@ -79,37 +73,48 @@ def fetch_or_load_rates():
 if __name__ == "__main__":
     try:
         data = fetch_or_load_rates()
+        hourly_details = data.get("hourlyPriceDetails") or []
+        if not hourly_details:
+            raise ValueError("No hourly price data available.")
 
-        all_prices = [item["price"] for item in data["hourlyPriceDetails"]]
+        hour_offset = detect_hour_offset(hourly_details)
+
+        all_prices = [item["price"] for item in hourly_details]
         sorted_prices = sorted(all_prices)
         n = len(sorted_prices)
         lower_third = sorted_prices[n // 3]
         upper_third = sorted_prices[(2 * n) // 3]
+        max_price = max(all_prices)
 
         first_half = []
         second_half = []
+        now = datetime.now()
+        current_hour = now.hour
+        current_time_marker = f">{BOLD}{now.hour:02}:{now.minute:02}{RESET}<"
 
-        for i, item in enumerate(data["hourlyPriceDetails"]):
-            time_label = hour_to_time(item["hour"])  # "01" -> 00:00, "24" -> 23:00
-            hour_int = int(item["hour"]) - 1
-            current_hour = datetime.now().hour
-            highlight_price = hour_int == current_hour
-            # Show current time marker on the "Hour" column row, even if the matching hour is in the PM half
-            if highlight_price or hour_int + 12 == current_hour:
-                time_label = f">{BOLD}{datetime.now().hour:02}:{datetime.now().minute:02}{RESET}<"
+        for i, item in enumerate(hourly_details):
+            time_label = hour_to_time(item["hour"], hour_offset)
+            normalized_hour = normalize_hour(item["hour"], hour_offset)
 
-            price = round(item["price"] * 100, 1)  # show in cents
+            highlight_price = normalized_hour == current_hour
+            if highlight_price or (normalized_hour + 12) % 24 == current_hour:
+                time_label = current_time_marker
+
+            price = round(item["price"] * 100, 1)
             price_colored = colorize_price(
                 price,
                 (lower_third * 100, upper_third * 100),
                 highlight_price,
-                is_max=(item["price"] == max(all_prices))
+                is_max=(item["price"] == max_price)
             )
 
             if i < 12:
                 first_half.append([time_label, price_colored])
             else:
                 second_half.append([price_colored])
+
+        while len(second_half) < len(first_half):
+            second_half.append([""])
 
         table = []
         for left, right in zip(first_half, second_half):

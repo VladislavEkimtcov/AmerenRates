@@ -1,13 +1,19 @@
 from datetime import datetime, timedelta
 
 
+def _parse_hour(hour_value):
+    try:
+        return int(hour_value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Invalid hour value: {hour_value}")
+
+
 def detect_hour_offset(hourly_price_details):
     hours = []
     for item in hourly_price_details or []:
-        hour_value = item.get("hour")
         try:
-            hours.append(int(hour_value))
-        except (TypeError, ValueError):
+            hours.append(_parse_hour(item.get("hour")))
+        except ValueError:
             continue
     if not hours:
         return 0
@@ -15,10 +21,7 @@ def detect_hour_offset(hourly_price_details):
 
 
 def normalize_hour(hour_str, offset=0):
-    try:
-        hour = int(hour_str)
-    except (TypeError, ValueError):
-        raise ValueError(f"Invalid hour value: {hour_str}")
+    hour = _parse_hour(hour_str)
     return (hour - offset) % 24
 
 

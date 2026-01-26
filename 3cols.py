@@ -7,7 +7,7 @@ import os
 import json
 from datetime import datetime
 from tabulate import tabulate
-from hour_utils import detect_hour_offset, normalize_hour, hour_to_time
+from hour_utils import detect_hour_offset, normalize_hour, hour_to_time, shift_hours_if_last_zero
 
 # ANSI escape sequences for terminal colors
 BOLD = '\033[1m'
@@ -74,6 +74,7 @@ if __name__ == "__main__":
     try:
         data = fetch_or_load_rates()
         hourly_details = data.get("hourlyPriceDetails") or []
+        hourly_details = shift_hours_if_last_zero(hourly_details)
         if not hourly_details:
             raise ValueError("No hourly price data available.")
 

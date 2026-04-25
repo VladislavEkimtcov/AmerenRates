@@ -10,6 +10,7 @@ combo = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(combo)
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+BG_RE = re.compile(r"\x1b\[(41|42|43|47)m")
 
 
 def strip_ansi(value):
@@ -17,7 +18,7 @@ def strip_ansi(value):
 
 
 class ComboFormattingTests(unittest.TestCase):
-    def test_colorize_price_contains_price_text_and_bar(self):
+    def test_colorize_price_contains_price_text_on_colored_bar(self):
         rendered = combo.colorize_price(
             12.3,
             thresholds=(5.0, 9.0),
@@ -25,7 +26,7 @@ class ComboFormattingTests(unittest.TestCase):
         )
         plain = strip_ansi(rendered)
         self.assertIn("¢12.3", plain)
-        self.assertIn("█", plain)
+        self.assertRegex(rendered, BG_RE)
 
     def test_negative_price_uses_negative_indicator(self):
         rendered = combo.colorize_price(
@@ -36,6 +37,17 @@ class ComboFormattingTests(unittest.TestCase):
         plain = strip_ansi(rendered)
         self.assertIn("¢-1.5", plain)
         self.assertIn("▒", plain)
+
+    def test_max_price_uses_distinct_background_overlay(self):
+        rendered = combo.colorize_price(
+            20.0,
+            thresholds=(5.0, 9.0),
+            max_price_cents=20.0,
+            is_max=True,
+        )
+        plain = strip_ansi(rendered)
+        self.assertIn("¢20.0", plain)
+        self.assertIn("\x1b[47m", rendered)
 
     def test_build_table_highlights_current_hour_and_keeps_pm_column(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]

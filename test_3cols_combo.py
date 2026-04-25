@@ -18,6 +18,14 @@ def strip_ansi(value):
 
 
 class ComboFormattingTests(unittest.TestCase):
+    def test_parse_args_uses_default_max_bar_width(self):
+        args = combo.parse_args([])
+        self.assertEqual(args.max_bar_width, 5)
+
+    def test_parse_args_allows_max_bar_width_override(self):
+        args = combo.parse_args(["--max-bar-width", "9"])
+        self.assertEqual(args.max_bar_width, 9)
+
     def test_colorize_price_contains_price_text_on_colored_bar(self):
         rendered = combo.colorize_price(
             12.3,
@@ -65,6 +73,11 @@ class ComboFormattingTests(unittest.TestCase):
     def test_build_table_rejects_empty_hour_list(self):
         with self.assertRaises(ValueError):
             combo.build_table([])
+
+    def test_build_table_rejects_non_positive_max_bar_width(self):
+        details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
+        with self.assertRaises(ValueError):
+            combo.build_table(details, max_bar_width=0)
 
 
 if __name__ == "__main__":

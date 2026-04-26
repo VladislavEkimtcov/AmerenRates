@@ -91,7 +91,7 @@ def colorize_price(
 		fill_length = _bar_length(price, max_price_cents, max_bar_width)
 		combined = _render_positive_bar(price_text, width, fill_length, text_color, background_color)
 
-	prefix = f">{BOLD}" if should_highlight else ""
+	prefix = f"{BOLD}" if should_highlight else ""
 	postfix = "<" if should_highlight else ""
 	return f"{prefix}{combined}{RESET}{postfix}"
 

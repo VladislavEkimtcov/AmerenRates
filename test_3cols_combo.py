@@ -26,11 +26,22 @@ class ComboFormattingTests(unittest.TestCase):
         args = combo.parse_args(["--max-bar-width", "9"])
         self.assertEqual(args.max_bar_width, 9)
 
-    def test_colorize_price_contains_price_text_on_colored_bar(self):
+    def test_colorize_price_uses_scaled_bar_when_text_does_not_fit(self):
         rendered = combo.colorize_price(
             12.3,
             thresholds=(5.0, 9.0),
             max_price_cents=20.0,
+        )
+        plain = strip_ansi(rendered)
+        self.assertEqual(plain, "¢12.3")
+        self.assertRegex(rendered, BG_RE)
+
+    def test_colorize_price_overlays_price_text_when_bar_is_wide_enough(self):
+        rendered = combo.colorize_price(
+            12.3,
+            thresholds=(5.0, 9.0),
+            max_price_cents=20.0,
+            max_bar_width=8,
         )
         plain = strip_ansi(rendered)
         self.assertIn("¢12.3", plain)
@@ -59,7 +70,7 @@ class ComboFormattingTests(unittest.TestCase):
 
     def test_build_table_highlights_current_hour_and_keeps_pm_column(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
-        table = combo.build_table(details, now=datetime(2026, 4, 24, 3, 15))
+        table = combo.build_table(details, now=datetime(2026, 4, 24, 3, 15), max_bar_width=8)
 
         self.assertEqual(len(table), 12)
         self.assertEqual(len(table[0]), 3)
@@ -68,6 +79,7 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertIn(">", highlighted_row[0])
         self.assertIn("03:15", strip_ansi(highlighted_row[0]))
         self.assertIn("¢4.0", strip_ansi(highlighted_row[1]))
+        self.assertTrue(strip_ansi(highlighted_row[1]).endswith("<"))
         self.assertIn("¢16.0", strip_ansi(highlighted_row[2]))
 
     def test_build_table_rejects_empty_hour_list(self):

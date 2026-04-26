@@ -41,9 +41,11 @@ def _color_for_price(price, thresholds, is_max=False):
 def _bar_length(price, max_price_cents, max_bar_width):
 	if price < 0:
 		return 1
-	if max_price_cents <= 0:
-		return 0
-	return max(1, int(round((price / max_price_cents) * max_bar_width)))
+	if max_price_cents > 0:
+		length = int(round((price / max_price_cents) * max_bar_width))
+	else:
+		length = 0
+	return max(1, length)
 
 
 def _bar_palette(price, thresholds, is_max=False):
@@ -57,15 +59,17 @@ def _bar_palette(price, thresholds, is_max=False):
 	return color, BLACK, BG_YELLOW
 
 
-def _render_positive_bar(text, width, fill_length, text_color, background_color):
-	effective_fill = min(width, max(fill_length, len(text) + 1 if width > len(text) else len(text)))
+def _render_positive_bar(text, width, text_color, background_color):
+	render_width = max(width, len(text))
 	parts = []
-	for index in range(width):
+
+	for index in range(render_width):
 		char = text[index] if index < len(text) else " "
-		if index < effective_fill:
+		if index < width:
 			parts.append(f"{background_color}{text_color}{char}{RESET}")
 		else:
 			parts.append(char)
+
 	return "".join(parts).rstrip()
 
 
@@ -81,15 +85,14 @@ def colorize_price(
 		raise ValueError("max_bar_width must be greater than 0")
 
 	price_text = f"{CENT}{price:.1f}"
-	width = max(max_bar_width, len(price_text) + 2)
 
 	if price < 0:
 		color = _color_for_price(price, thresholds, is_max=is_max)
 		combined = f"{color}▒{price_text}{RESET}"
 	else:
-		_, text_color, background_color = _bar_palette(price, thresholds, is_max=is_max)
 		fill_length = _bar_length(price, max_price_cents, max_bar_width)
-		combined = _render_positive_bar(price_text, width, fill_length, text_color, background_color)
+		_, text_color, background_color = _bar_palette(price, thresholds, is_max=is_max)
+		combined = _render_positive_bar(price_text, fill_length, text_color, background_color)
 
 	prefix = f"{BOLD}" if should_highlight else ""
 	postfix = "<" if should_highlight else ""

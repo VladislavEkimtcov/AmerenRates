@@ -35,6 +35,8 @@ class ComboFormattingTests(unittest.TestCase):
         plain = strip_ansi(rendered)
         self.assertEqual(plain, "¢12.3")
         self.assertRegex(rendered, BG_RE)
+        self.assertIn(f"{combo.RED}.{combo.RESET}", rendered)
+        self.assertIn(f"{combo.RED}3{combo.RESET}", rendered)
 
     def test_colorize_price_overlays_price_text_when_bar_is_wide_enough(self):
         rendered = combo.colorize_price(
@@ -67,6 +69,18 @@ class ComboFormattingTests(unittest.TestCase):
         plain = strip_ansi(rendered)
         self.assertIn("¢20.0", plain)
         self.assertIn("\x1b[47m", rendered)
+
+    def test_max_price_overflow_digits_remain_colored(self):
+        rendered = combo.colorize_price(
+            120.0,
+            thresholds=(5.0, 9.0),
+            max_price_cents=120.0,
+            is_max=True,
+        )
+        plain = strip_ansi(rendered)
+        self.assertEqual(plain, "¢120.0")
+        self.assertIn(combo.BG_WHITE, rendered)
+        self.assertIn(f"{combo.WHITE}0{combo.RESET}", rendered)
 
     def test_build_table_highlights_current_hour_and_keeps_pm_column(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]

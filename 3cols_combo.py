@@ -59,7 +59,13 @@ def _bar_palette(price, thresholds, is_max=False):
 	return color, BLACK, BG_YELLOW
 
 
-def _render_positive_bar(text, width, text_color, background_color):
+def _overflow_text_color(price, thresholds, is_max=False):
+	if is_max:
+		return WHITE
+	return _color_for_price(price, thresholds)
+
+
+def _render_positive_bar(text, width, text_color, background_color, overflow_color):
 	render_width = max(width, len(text))
 	parts = []
 
@@ -67,6 +73,8 @@ def _render_positive_bar(text, width, text_color, background_color):
 		char = text[index] if index < len(text) else " "
 		if index < width:
 			parts.append(f"{background_color}{text_color}{char}{RESET}")
+		elif char != " ":
+			parts.append(f"{overflow_color}{char}{RESET}")
 		else:
 			parts.append(char)
 
@@ -92,7 +100,8 @@ def colorize_price(
 	else:
 		fill_length = _bar_length(price, max_price_cents, max_bar_width)
 		_, text_color, background_color = _bar_palette(price, thresholds, is_max=is_max)
-		combined = _render_positive_bar(price_text, fill_length, text_color, background_color)
+		overflow_color = _overflow_text_color(price, thresholds, is_max=is_max)
+		combined = _render_positive_bar(price_text, fill_length, text_color, background_color, overflow_color)
 
 	prefix = f"{BOLD}" if should_highlight else ""
 	postfix = "<" if should_highlight else ""

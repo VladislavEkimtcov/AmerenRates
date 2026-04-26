@@ -1,7 +1,9 @@
 RATES_URL = "https://www.ameren.com/api/ameren/promotion/RtpHourlyPricesbyDate"
 CACHE_FILENAME = "cached_rates.json"
 HIGH_PRICE_THRESHOLD = 10
+DEFAULT_MAX_BAR_WIDTH = 5
 
+import argparse
 import requests
 import os
 import json
@@ -18,7 +20,17 @@ RESET = '\033[0m'
 CENT = '¢'
 
 
-def colorize_price(price, thresholds, max_price_cents, should_highlight=False, is_max=False):
+def colorize_price(
+    price,
+    thresholds,
+    max_price_cents,
+    should_highlight=False,
+    is_max=False,
+    max_bar_width=DEFAULT_MAX_BAR_WIDTH,
+):
+    if max_bar_width <= 0:
+        raise ValueError("max_bar_width must be greater than 0")
+
     if is_max:
         color = RESET
     elif price > HIGH_PRICE_THRESHOLD or price > thresholds[1]:
@@ -28,18 +40,17 @@ def colorize_price(price, thresholds, max_price_cents, should_highlight=False, i
     else:
         color = YELLOW
 
-    MAX_BAR = 5
     if price < 0:
         bar = "▒"
     else:
         if max_price_cents > 0:
-            length = int(round((price / max_price_cents) * MAX_BAR))
+            length = int(round((price / max_price_cents) * max_bar_width))
         else:
             length = 0
         length = max(1, length)
         bar = "█" * length
 
-    prefix = f">{BOLD}" if should_highlight else ""
+    prefix = f"{BOLD}" if should_highlight else ""
     postfix = "<" if should_highlight else ""
     return f"{prefix}{color}{bar}{RESET}{postfix}"
 
@@ -81,59 +92,87 @@ def fetch_or_load_rates():
         raise RuntimeError(f"Failed to fetch rates: {response.status_code} - {response.text}")
 
 
+def build_table(hourly_details, now=None, max_bar_width=DEFAULT_MAX_BAR_WIDTH):
+    if max_bar_width <= 0:
+        raise ValueError("max_bar_width must be greater than 0")
+
+    hourly_details = shift_hours_if_last_zero(hourly_details)
+    if not hourly_details:
+        raise ValueError("No hourly price data available.")
+
+    hour_offset = detect_hour_offset(hourly_details)
+
+    all_prices = [item["price"] for item in hourly_details]
+    sorted_prices = sorted(all_prices)
+    n = len(sorted_prices)
+    lower_third = sorted_prices[n // 3]
+    upper_third = sorted_prices[(2 * n) // 3]
+    max_price = max(all_prices)
+
+    first_half = []
+    second_half = []
+    now = now or datetime.now()
+    current_hour = now.hour
+    current_time_marker = f">{BOLD}{now.hour:02}:{now.minute:02}{RESET}<"
+
+    for i, item in enumerate(hourly_details):
+        time_label = hour_to_time(item["hour"], hour_offset)
+        normalized_hour = normalize_hour(item["hour"], hour_offset)
+
+        highlight_price = normalized_hour == current_hour
+        if highlight_price or (normalized_hour + 12) % 24 == current_hour:
+            time_label = current_time_marker
+
+        price = round(item["price"] * 100, 1)
+        price_colored = colorize_price(
+            price,
+            (lower_third * 100, upper_third * 100),
+            max_price * 100,
+            highlight_price,
+            is_max=(item["price"] == max_price),
+            max_bar_width=max_bar_width,
+        )
+
+        if i < 12:
+            first_half.append([time_label, price_colored])
+        else:
+            second_half.append([price_colored])
+
+    while len(second_half) < len(first_half):
+        second_half.append([""])
+
+    return [left + right for left, right in zip(first_half, second_half)]
+
+
+def _positive_int(value):
+    parsed = int(value)
+    if parsed <= 0:
+        raise argparse.ArgumentTypeError("max bar width must be greater than 0")
+    return parsed
+
+
+def parse_args(argv=None):
+    parser = argparse.ArgumentParser(description="Show Ameren hourly rates as a graph.")
+    parser.add_argument(
+        "--max-bar-width",
+        type=_positive_int,
+        default=DEFAULT_MAX_BAR_WIDTH,
+        help=f"Maximum width used to scale the graph bars (default: {DEFAULT_MAX_BAR_WIDTH})",
+    )
+    return parser.parse_args(argv)
+
+
+def main(argv=None):
+    args = parse_args(argv)
+    data = fetch_or_load_rates()
+    hourly_details = data.get("hourlyPriceDetails") or []
+    table = build_table(hourly_details, max_bar_width=args.max_bar_width)
+    print(tabulate(table, headers=["Hour", "AM", "PM"], tablefmt="plain"))
+
+
 if __name__ == "__main__":
     try:
-        data = fetch_or_load_rates()
-        hourly_details = data.get("hourlyPriceDetails") or []
-        hourly_details = shift_hours_if_last_zero(hourly_details)
-        if not hourly_details:
-            raise ValueError("No hourly price data available.")
-
-        hour_offset = detect_hour_offset(hourly_details)
-
-        all_prices = [item["price"] for item in hourly_details]
-        sorted_prices = sorted(all_prices)
-        n = len(sorted_prices)
-        lower_third = sorted_prices[n // 3]
-        upper_third = sorted_prices[(2 * n) // 3]
-        max_price = max(all_prices)
-
-        first_half = []
-        second_half = []
-        now = datetime.now()
-        current_hour = now.hour
-        current_time_marker = f">{BOLD}{now.hour:02}:{now.minute:02}{RESET}<"
-
-        for i, item in enumerate(hourly_details):
-            time_label = hour_to_time(item["hour"], hour_offset)
-            normalized_hour = normalize_hour(item["hour"], hour_offset)
-
-            highlight_price = normalized_hour == current_hour
-            if highlight_price or (normalized_hour + 12) % 24 == current_hour:
-                time_label = current_time_marker
-
-            price = round(item["price"] * 100, 1)
-            price_colored = colorize_price(
-                price,
-                (lower_third * 100, upper_third * 100),
-                max_price * 100,
-                highlight_price,
-                is_max=(item["price"] == max_price)
-            )
-
-            if i < 12:
-                first_half.append([time_label, price_colored])
-            else:
-                second_half.append([price_colored])
-
-        while len(second_half) < len(first_half):
-            second_half.append([""])
-
-        table = []
-        for left, right in zip(first_half, second_half):
-            table.append(left + right)
-
-        print(tabulate(table, headers=["Hour", "AM", "PM"], tablefmt="plain"))
+        main()
 
     except Exception as e:
         print(f"Error: {e}")

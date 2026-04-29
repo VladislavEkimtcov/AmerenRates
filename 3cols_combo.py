@@ -1,7 +1,7 @@
 RATES_URL = "https://www.ameren.com/api/ameren/promotion/RtpHourlyPricesbyDate"
 CACHE_FILENAME = "cached_rates.json"
 HIGH_PRICE_THRESHOLD = 10
-DEFAULT_MAX_BAR_WIDTH = 5
+DEFAULT_bar = 5
 
 import argparse
 import json
@@ -38,11 +38,11 @@ def _color_for_price(price, thresholds, is_max=False):
 	return YELLOW
 
 
-def _bar_length(price, max_price_cents, max_bar_width):
+def _bar_length(price, max_price_cents, bar):
 	if price < 0:
 		return 1
 	if max_price_cents > 0:
-		length = int(round((price / max_price_cents) * max_bar_width))
+		length = int(round((price / max_price_cents) * bar))
 	else:
 		length = 0
 	return max(1, length)
@@ -87,10 +87,10 @@ def colorize_price(
 	max_price_cents,
 	should_highlight=False,
 	is_max=False,
-	max_bar_width=DEFAULT_MAX_BAR_WIDTH,
+	bar=DEFAULT_bar,
 ):
-	if max_bar_width <= 0:
-		raise ValueError("max_bar_width must be greater than 0")
+	if bar <= 0:
+		raise ValueError("bar must be greater than 0")
 
 	price_text = f"{CENT}{price:.1f}"
 
@@ -98,7 +98,7 @@ def colorize_price(
 		color = _color_for_price(price, thresholds, is_max=is_max)
 		combined = f"{color}▒{price_text}{RESET}"
 	else:
-		fill_length = _bar_length(price, max_price_cents, max_bar_width)
+		fill_length = _bar_length(price, max_price_cents, bar)
 		_, text_color, background_color = _bar_palette(price, thresholds, is_max=is_max)
 		overflow_color = _overflow_text_color(price, thresholds, is_max=is_max)
 		combined = _render_positive_bar(price_text, fill_length, text_color, background_color, overflow_color)
@@ -145,9 +145,9 @@ def fetch_or_load_rates():
 	raise RuntimeError(f"Failed to fetch rates: {response.status_code} - {response.text}")
 
 
-def build_table(hourly_details, now=None, max_bar_width=DEFAULT_MAX_BAR_WIDTH):
-	if max_bar_width <= 0:
-		raise ValueError("max_bar_width must be greater than 0")
+def build_table(hourly_details, now=None, bar=DEFAULT_bar):
+	if bar <= 0:
+		raise ValueError("bar must be greater than 0")
 
 	hourly_details = shift_hours_if_last_zero(hourly_details)
 	if not hourly_details:
@@ -183,7 +183,7 @@ def build_table(hourly_details, now=None, max_bar_width=DEFAULT_MAX_BAR_WIDTH):
 			max_price * 100,
 			should_highlight=highlight_price,
 			is_max=(item["price"] == max_price),
-			max_bar_width=max_bar_width,
+			bar=bar,
 		)
 
 		if index < 12:
@@ -207,10 +207,10 @@ def _positive_int(value):
 def parse_args(argv=None):
 	parser = argparse.ArgumentParser(description="Show Ameren hourly rates with prices overlaid on bars.")
 	parser.add_argument(
-		"--max-bar-width",
+		"-bar",
 		type=_positive_int,
-		default=DEFAULT_MAX_BAR_WIDTH,
-		help=f"Maximum width used to scale the colored bars (default: {DEFAULT_MAX_BAR_WIDTH})",
+		default=DEFAULT_bar,
+		help=f"Maximum width used to scale the colored bars (default: {DEFAULT_bar})",
 	)
 	return parser.parse_args(argv)
 
@@ -219,7 +219,7 @@ def main(argv=None):
 	args = parse_args(argv)
 	data = fetch_or_load_rates()
 	hourly_details = data.get("hourlyPriceDetails") or []
-	table = build_table(hourly_details, max_bar_width=args.max_bar_width)
+	table = build_table(hourly_details, bar=args.bar)
 	print(tabulate(table, headers=["Hour", "AM", "PM"], tablefmt="plain"))
 
 

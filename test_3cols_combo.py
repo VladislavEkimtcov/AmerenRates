@@ -18,13 +18,13 @@ def strip_ansi(value):
 
 
 class ComboFormattingTests(unittest.TestCase):
-    def test_parse_args_uses_default_max_bar_width(self):
+    def test_parse_args_uses_default_bar(self):
         args = combo.parse_args([])
-        self.assertEqual(args.max_bar_width, 5)
+        self.assertEqual(args.bar, 5)
 
-    def test_parse_args_allows_max_bar_width_override(self):
-        args = combo.parse_args(["--max-bar-width", "9"])
-        self.assertEqual(args.max_bar_width, 9)
+    def test_parse_args_allows_bar_override(self):
+        args = combo.parse_args(["-bar", "9"])
+        self.assertEqual(args.bar, 9)
 
     def test_colorize_price_uses_scaled_bar_when_text_does_not_fit(self):
         rendered = combo.colorize_price(
@@ -43,7 +43,7 @@ class ComboFormattingTests(unittest.TestCase):
             12.3,
             thresholds=(5.0, 9.0),
             max_price_cents=20.0,
-            max_bar_width=8,
+            bar=8,
         )
         plain = strip_ansi(rendered)
         self.assertIn("¢12.3", plain)
@@ -84,7 +84,7 @@ class ComboFormattingTests(unittest.TestCase):
 
     def test_build_table_highlights_current_hour_and_keeps_pm_column(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
-        table = combo.build_table(details, now=datetime(2026, 4, 24, 3, 15), max_bar_width=8)
+        table = combo.build_table(details, now=datetime(2026, 4, 24, 3, 15), bar=8)
 
         self.assertEqual(len(table), 12)
         self.assertEqual(len(table[0]), 3)
@@ -100,10 +100,10 @@ class ComboFormattingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             combo.build_table([])
 
-    def test_build_table_rejects_non_positive_max_bar_width(self):
+    def test_build_table_rejects_non_positive_bar(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
         with self.assertRaises(ValueError):
-            combo.build_table(details, max_bar_width=0)
+            combo.build_table(details, bar=0)
 
 
 if __name__ == "__main__":

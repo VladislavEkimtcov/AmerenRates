@@ -17,17 +17,17 @@ def strip_ansi(value):
 
 
 class GraphFormattingTests(unittest.TestCase):
-    def test_parse_args_uses_default_max_bar_width(self):
+    def test_parse_args_uses_default_bar(self):
         args = graph.parse_args([])
-        self.assertEqual(args.max_bar_width, 5)
+        self.assertEqual(args.bar, 5)
 
-    def test_parse_args_allows_max_bar_width_override(self):
-        args = graph.parse_args(["--max-bar-width", "9"])
-        self.assertEqual(args.max_bar_width, 9)
+    def test_parse_args_allows_bar_override(self):
+        args = graph.parse_args(["-bar", "9"])
+        self.assertEqual(args.bar, 9)
 
-    def test_colorize_price_respects_max_bar_width(self):
-        small = strip_ansi(graph.colorize_price(10.0, (2.0, 8.0), 10.0, max_bar_width=3))
-        large = strip_ansi(graph.colorize_price(10.0, (2.0, 8.0), 10.0, max_bar_width=7))
+    def test_colorize_price_respects_bar(self):
+        small = strip_ansi(graph.colorize_price(10.0, (2.0, 8.0), 10.0, bar=3))
+        large = strip_ansi(graph.colorize_price(10.0, (2.0, 8.0), 10.0, bar=7))
         self.assertEqual(small, "███")
         self.assertEqual(large, "███████")
 
@@ -35,10 +35,10 @@ class GraphFormattingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             graph.build_table([])
 
-    def test_build_table_rejects_non_positive_max_bar_width(self):
+    def test_build_table_rejects_non_positive_bar(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
         with self.assertRaises(ValueError):
-            graph.build_table(details, max_bar_width=0)
+            graph.build_table(details, bar=0)
 
     def test_build_table_highlights_current_hour(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]

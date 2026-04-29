@@ -206,7 +206,7 @@ def build_table(hourly_details, now=None, bar=DEFAULT_bar):
 	second_half = []
 	now = now or datetime.now()
 	current_hour = now.hour
-	current_time_marker = f"{BOLD}{now.hour:02}:{now.minute:02}{RESET}<"
+	current_time_marker = f">{BOLD}{now.hour:02}:{now.minute:02}{RESET}<"
 
 	for index, item in enumerate(hourly_details):
 		time_label = hour_to_time(item["hour"], hour_offset)

@@ -6,10 +6,10 @@ DEFAULT_bar = 5
 import argparse
 import json
 import os
+import re
 from datetime import datetime
 
 import requests
-from tabulate import tabulate
 
 from hour_utils import detect_hour_offset, normalize_hour, hour_to_time, shift_hours_if_last_zero
 
@@ -26,6 +26,7 @@ BG_RED = '\033[41m'
 BG_WHITE = '\033[47m'
 RESET = '\033[0m'
 CENT = '¢'
+ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 def _color_for_price(price, thresholds, is_max=False):
@@ -71,9 +72,8 @@ def _render_positive_bar(
 	text_color,
 	background_color,
 	overflow_color,
-	trim_trailing_fill=False,
 ):
-	render_width = len(text) if trim_trailing_fill and width > len(text) else max(width, len(text))
+	render_width = max(width, len(text))
 	parts = []
 
 	for index in range(render_width):
@@ -95,7 +95,6 @@ def colorize_price(
 	should_highlight=False,
 	is_max=False,
 	bar=DEFAULT_bar,
-	trim_trailing_fill=False,
 ):
 	if bar <= 0:
 		raise ValueError("bar must be greater than 0")
@@ -115,7 +114,6 @@ def colorize_price(
 			text_color,
 			background_color,
 			overflow_color,
-			trim_trailing_fill=trim_trailing_fill,
 		)
 
 	prefix = f"{BOLD}" if should_highlight else ""
@@ -160,6 +158,33 @@ def fetch_or_load_rates():
 	raise RuntimeError(f"Failed to fetch rates: {response.status_code} - {response.text}")
 
 
+def _visible_width(value):
+	return len(ANSI_RE.sub("", value))
+
+
+def _pad_cell(value, width):
+	return f"{value}{' ' * max(0, width - _visible_width(value))}"
+
+
+def _format_plain_table(rows, headers):
+	widths = []
+	for index, header in enumerate(headers):
+		cell_widths = [_visible_width(row[index]) for row in rows]
+		widths.append(max([_visible_width(header)] + cell_widths))
+
+	formatted = []
+	for row in [headers] + rows:
+		cells = []
+		for index, value in enumerate(row):
+			if index == len(row) - 1:
+				cells.append(value)
+			else:
+				cells.append(_pad_cell(value, widths[index]))
+		formatted.append(" ".join(cells).rstrip())
+
+	return "\n".join(formatted)
+
+
 def build_table(hourly_details, now=None, bar=DEFAULT_bar):
 	if bar <= 0:
 		raise ValueError("bar must be greater than 0")
@@ -199,7 +224,6 @@ def build_table(hourly_details, now=None, bar=DEFAULT_bar):
 			should_highlight=highlight_price,
 			is_max=(item["price"] == max_price),
 			bar=bar,
-			trim_trailing_fill=(index >= 12),
 		)
 
 		if index < 12:
@@ -236,7 +260,7 @@ def main(argv=None):
 	data = fetch_or_load_rates()
 	hourly_details = data.get("hourlyPriceDetails") or []
 	table = build_table(hourly_details, bar=args.bar)
-	print(tabulate(table, headers=["Hour", "AM", "PM"], tablefmt="plain"))
+	print(_format_plain_table(table, headers=["Hour", "AM", "PM"]))
 
 
 if __name__ == "__main__":

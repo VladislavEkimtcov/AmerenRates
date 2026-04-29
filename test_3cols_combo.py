@@ -49,17 +49,16 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertIn("¢12.3", plain)
         self.assertRegex(rendered, BG_RE)
 
-    def test_colorize_price_can_trim_trailing_fill_and_keep_text_left_biased(self):
+    def test_colorize_price_preserves_full_bar_width_when_text_fits_inside(self):
         rendered = combo.colorize_price(
             9.5,
             thresholds=(5.0, 9.0),
             max_price_cents=9.5,
             is_max=True,
             bar=7,
-            trim_trailing_fill=True,
         )
         plain = strip_ansi(rendered)
-        self.assertEqual(plain, "¢9.5")
+        self.assertEqual(plain, "¢9.5   ")
         self.assertRegex(rendered, BG_RE)
 
     def test_negative_price_uses_negative_indicator(self):
@@ -109,13 +108,20 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertTrue(strip_ansi(highlighted_row[1]).endswith("<"))
         self.assertIn("¢16.0", strip_ansi(highlighted_row[2]))
 
-    def test_build_table_trims_pm_bar_padding_without_right_bias(self):
+    def test_build_table_keeps_full_pm_bar_width(self):
         details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
         table = combo.build_table(details, now=datetime(2026, 4, 24, 3, 15), bar=7)
 
         pm_plain = strip_ansi(table[11][2])
-        self.assertEqual(pm_plain, "¢24.0")
-        self.assertFalse(pm_plain.endswith(" "))
+        self.assertEqual(pm_plain, "¢24.0  ")
+
+    def test_format_plain_table_uses_single_space_gutters(self):
+        rows = [[">03:15<", "¢4.0 ", "¢16.0  "]]
+        rendered = combo._format_plain_table(rows, headers=["Hour", "AM", "PM"])
+
+        lines = rendered.splitlines()
+        plain_lines = [strip_ansi(line) for line in lines]
+        self.assertEqual(plain_lines[1], ">03:15< ¢4.0  ¢16.0")
 
     def test_build_table_rejects_empty_hour_list(self):
         with self.assertRaises(ValueError):

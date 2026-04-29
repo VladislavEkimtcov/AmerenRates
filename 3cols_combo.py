@@ -65,12 +65,25 @@ def _overflow_text_color(price, thresholds, is_max=False):
 	return _color_for_price(price, thresholds)
 
 
-def _render_positive_bar(text, width, text_color, background_color, overflow_color):
+def _render_positive_bar(
+	text,
+	width,
+	text_color,
+	background_color,
+	overflow_color,
+	align_text_right=False,
+):
 	render_width = max(width, len(text))
 	parts = []
+	text_start = width - len(text) if align_text_right and width > len(text) else 0
 
 	for index in range(render_width):
-		char = text[index] if index < len(text) else " "
+		if text_start and index < text_start:
+			char = " "
+		elif text_start:
+			char = text[index - text_start]
+		else:
+			char = text[index] if index < len(text) else " "
 		if index < width:
 			parts.append(f"{background_color}{text_color}{char}{RESET}")
 		elif char != " ":
@@ -88,6 +101,7 @@ def colorize_price(
 	should_highlight=False,
 	is_max=False,
 	bar=DEFAULT_bar,
+	align_text_right=False,
 ):
 	if bar <= 0:
 		raise ValueError("bar must be greater than 0")
@@ -101,7 +115,14 @@ def colorize_price(
 		fill_length = _bar_length(price, max_price_cents, bar)
 		_, text_color, background_color = _bar_palette(price, thresholds, is_max=is_max)
 		overflow_color = _overflow_text_color(price, thresholds, is_max=is_max)
-		combined = _render_positive_bar(price_text, fill_length, text_color, background_color, overflow_color)
+		combined = _render_positive_bar(
+			price_text,
+			fill_length,
+			text_color,
+			background_color,
+			overflow_color,
+			align_text_right=align_text_right,
+		)
 
 	prefix = f"{BOLD}" if should_highlight else ""
 	postfix = "<" if should_highlight else ""
@@ -184,6 +205,7 @@ def build_table(hourly_details, now=None, bar=DEFAULT_bar):
 			should_highlight=highlight_price,
 			is_max=(item["price"] == max_price),
 			bar=bar,
+			align_text_right=(index >= 12),
 		)
 
 		if index < 12:

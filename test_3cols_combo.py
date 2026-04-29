@@ -49,6 +49,19 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertIn("¢12.3", plain)
         self.assertRegex(rendered, BG_RE)
 
+    def test_colorize_price_can_right_align_text_inside_bar(self):
+        rendered = combo.colorize_price(
+            9.5,
+            thresholds=(5.0, 9.0),
+            max_price_cents=9.5,
+            is_max=True,
+            bar=7,
+            align_text_right=True,
+        )
+        plain = strip_ansi(rendered)
+        self.assertEqual(plain, "   ¢9.5")
+        self.assertRegex(rendered, BG_RE)
+
     def test_negative_price_uses_negative_indicator(self):
         rendered = combo.colorize_price(
             -1.5,
@@ -95,6 +108,14 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertIn("¢4.0", strip_ansi(highlighted_row[1]))
         self.assertTrue(strip_ansi(highlighted_row[1]).endswith("<"))
         self.assertIn("¢16.0", strip_ansi(highlighted_row[2]))
+
+    def test_build_table_right_aligns_pm_bar_padding(self):
+        details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
+        table = combo.build_table(details, now=datetime(2026, 4, 24, 3, 15), bar=7)
+
+        pm_plain = strip_ansi(table[11][2])
+        self.assertEqual(pm_plain, "  ¢24.0")
+        self.assertFalse(pm_plain.endswith(" "))
 
     def test_build_table_rejects_empty_hour_list(self):
         with self.assertRaises(ValueError):

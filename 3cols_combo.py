@@ -71,19 +71,13 @@ def _render_positive_bar(
 	text_color,
 	background_color,
 	overflow_color,
-	align_text_right=False,
+	trim_trailing_fill=False,
 ):
-	render_width = max(width, len(text))
+	render_width = len(text) if trim_trailing_fill and width > len(text) else max(width, len(text))
 	parts = []
-	text_start = width - len(text) if align_text_right and width > len(text) else 0
 
 	for index in range(render_width):
-		if text_start and index < text_start:
-			char = " "
-		elif text_start:
-			char = text[index - text_start]
-		else:
-			char = text[index] if index < len(text) else " "
+		char = text[index] if index < len(text) else " "
 		if index < width:
 			parts.append(f"{background_color}{text_color}{char}{RESET}")
 		elif char != " ":
@@ -101,7 +95,7 @@ def colorize_price(
 	should_highlight=False,
 	is_max=False,
 	bar=DEFAULT_bar,
-	align_text_right=False,
+	trim_trailing_fill=False,
 ):
 	if bar <= 0:
 		raise ValueError("bar must be greater than 0")
@@ -121,7 +115,7 @@ def colorize_price(
 			text_color,
 			background_color,
 			overflow_color,
-			align_text_right=align_text_right,
+			trim_trailing_fill=trim_trailing_fill,
 		)
 
 	prefix = f"{BOLD}" if should_highlight else ""
@@ -205,7 +199,7 @@ def build_table(hourly_details, now=None, bar=DEFAULT_bar):
 			should_highlight=highlight_price,
 			is_max=(item["price"] == max_price),
 			bar=bar,
-			align_text_right=(index >= 12),
+			trim_trailing_fill=(index >= 12),
 		)
 
 		if index < 12:

@@ -12,6 +12,7 @@ from datetime import datetime
 import requests
 
 from hour_utils import detect_hour_offset, normalize_hour, hour_to_time, shift_hours_if_last_zero
+from ptc_pull import PTC_FAILURE_VALUE, get_cached_price_to_compare
 
 # ANSI escape sequences for terminal colors
 BOLD = '\033[1m'
@@ -153,9 +154,28 @@ def fetch_or_load_rates():
 				"requestedDate": today_display,
 				"data": data,
 			}, f)
+		get_cached_price_to_compare(today_iso)
 		return data
 
 	raise RuntimeError(f"Failed to fetch rates: {response.status_code} - {response.text}")
+
+
+def apply_price_to_compare_threshold():
+	global HIGH_PRICE_THRESHOLD
+
+	today_iso = datetime.now().date().isoformat()
+	cached_price = get_cached_price_to_compare(today_iso)
+	if cached_price == PTC_FAILURE_VALUE:
+		HIGH_PRICE_THRESHOLD = 10
+		return False
+
+	try:
+		HIGH_PRICE_THRESHOLD = float(cached_price)
+	except (TypeError, ValueError):
+		HIGH_PRICE_THRESHOLD = 10
+		return False
+
+	return True
 
 
 def _visible_width(value):
@@ -258,9 +278,12 @@ def parse_args(argv=None):
 def main(argv=None):
 	args = parse_args(argv)
 	data = fetch_or_load_rates()
+	ptc_loaded = apply_price_to_compare_threshold()
 	hourly_details = data.get("hourlyPriceDetails") or []
 	table = build_table(hourly_details, bar=args.bar)
 	print(_format_plain_table(table, headers=["Hour", "AM", "PM"]))
+	if not ptc_loaded:
+		print(f"{RED}PTC FETCH FAILURE{RESET}")
 
 
 if __name__ == "__main__":
@@ -268,4 +291,3 @@ if __name__ == "__main__":
 		main()
 	except Exception as e:
 		print(f"Error: {e}")
-

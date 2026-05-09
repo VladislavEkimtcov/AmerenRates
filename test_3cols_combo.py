@@ -1,8 +1,13 @@
 import importlib.util
+import io
+import json
 import re
+import tempfile
 import unittest
+from contextlib import redirect_stdout
 from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 MODULE_PATH = Path(__file__).with_name("3cols_combo.py")
 spec = importlib.util.spec_from_file_location("threecols_combo", MODULE_PATH)
@@ -17,7 +22,18 @@ def strip_ansi(value):
     return ANSI_RE.sub("", value)
 
 
+class FakeRatesResponse:
+    status_code = 200
+    text = ""
+
+    def json(self):
+        return {"hourlyPriceDetails": []}
+
+
 class ComboFormattingTests(unittest.TestCase):
+    def tearDown(self):
+        combo.HIGH_PRICE_THRESHOLD = 10
+
     def test_parse_args_uses_default_bar(self):
         args = combo.parse_args([])
         self.assertEqual(args.bar, 5)
@@ -132,7 +148,71 @@ class ComboFormattingTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             combo.build_table(details, bar=0)
 
+    def test_apply_price_to_compare_threshold_uses_cached_value(self):
+        with mock.patch.object(combo, "get_cached_price_to_compare", return_value="8.769"):
+            loaded = combo.apply_price_to_compare_threshold()
+
+        self.assertTrue(loaded)
+        self.assertEqual(combo.HIGH_PRICE_THRESHOLD, 8.769)
+
+    def test_apply_price_to_compare_threshold_defaults_on_null(self):
+        combo.HIGH_PRICE_THRESHOLD = 8.769
+
+        with mock.patch.object(combo, "get_cached_price_to_compare", return_value="NULL"):
+            loaded = combo.apply_price_to_compare_threshold()
+
+        self.assertFalse(loaded)
+        self.assertEqual(combo.HIGH_PRICE_THRESHOLD, 10)
+
+    def test_fetch_or_load_rates_checks_ptc_when_fetching_fresh_rates(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "cached_rates.json"
+            checked_dates = []
+
+            with (
+                mock.patch.object(combo, "CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo.requests, "post", return_value=FakeRatesResponse()),
+                mock.patch.object(combo, "get_cached_price_to_compare", side_effect=checked_dates.append),
+            ):
+                data = combo.fetch_or_load_rates()
+
+        self.assertEqual(data, {"hourlyPriceDetails": []})
+        self.assertEqual(len(checked_dates), 1)
+
+    def test_fetch_or_load_rates_skips_ptc_when_using_cached_rates(self):
+        today_iso = datetime.now().date().isoformat()
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "cached_rates.json"
+            cache_filename.write_text(json.dumps({
+                "date": today_iso,
+                "data": {"hourlyPriceDetails": [{"hour": "00", "price": 0.01}]},
+            }))
+
+            with (
+                mock.patch.object(combo, "CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo, "get_cached_price_to_compare") as get_ptc,
+            ):
+                data = combo.fetch_or_load_rates()
+
+        self.assertEqual(data, {"hourlyPriceDetails": [{"hour": "00", "price": 0.01}]})
+        get_ptc.assert_not_called()
+
+    def test_main_prints_ptc_failure_after_table(self):
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(combo, "fetch_or_load_rates", return_value={"hourlyPriceDetails": []}),
+            mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=False),
+            mock.patch.object(combo, "build_table", return_value=[["12:00", "¢1.0", ""]]),
+            redirect_stdout(output),
+        ):
+            combo.main([])
+
+        lines = strip_ansi(output.getvalue()).splitlines()
+        self.assertEqual(lines[0], "Hour  AM   PM")
+        self.assertEqual(lines[-1], "PTC FETCH FAILURE")
+
 
 if __name__ == "__main__":
     unittest.main()
-

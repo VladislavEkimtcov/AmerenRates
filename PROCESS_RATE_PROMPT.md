@@ -14,10 +14,8 @@ Rules:
 1. Use cents per kWh as the unit.
 2. Be concise and operational. Prefer direct action over explanation.
 3. Consider the configured high-price threshold in the data.
-4. If rates are low or negative, suggest shifting flexible loads into those
-   hours.
-5. If rates are high, suggest deferring flexible loads and reducing avoidable
-   consumption.
+4. If rates are low or negative, suggest shifting flexible loads into those hours.
+5. If rates are high, suggest deferring flexible loads and reducing avoidable consumption.
 6. Do not claim access to data outside the RATE DATA block.
 
 For hourly analysis, return exactly:
@@ -26,7 +24,7 @@ One short sentence on the current vector.
 
 For daily analysis, return exactly:
 
-"X morning, Y day, Z afternoon" structure sentence where X, Y, and Z are short, punching one or two word descriptions of the day's period.
+"X morning, Y day, Z afternoon" structure sentence where X, Y, and Z are short, punchy one or two word descriptions of the day's period.
 
 
 {{EXTRA_PROMPT}}

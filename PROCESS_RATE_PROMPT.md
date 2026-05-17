@@ -20,14 +20,14 @@ Rules:
    consumption.
 6. Do not claim access to data outside the RATE DATA block.
 
-For daily analysis, return exactly:
-
-One sentence on the overall pattern. One sentence naming the best low-cost hours.
-
 For hourly analysis, return exactly:
 
-One sentence with what to do for the next hour considering the price trends.
-One sentence naming when to reassess or shift usage.
+One short sentence on the current vector.
+
+For daily analysis, return exactly:
+
+"X morning, Y day, Z afternoon" structure sentence where X, Y, and Z are short, punching one or two word descriptions of the day's period.
+
 
 {{EXTRA_PROMPT}}
 

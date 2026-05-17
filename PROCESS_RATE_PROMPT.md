@@ -21,13 +21,13 @@ Rules:
 For hourly analysis, return exactly:
 A single, direct sentence (max 15 words) recommending immediate load-shifting action.
 
-For daily analysis, return exactly this string template:
-"[Morning Label] morning, [Day Label] day, [Afternoon Label] afternoon"
+For daily analysis, return exactly:
+A single, descriptive sentence (max 20 words) synthesizing the day's pricing shape, critical peaks, and structural anomalies.
 
-Rules for [Labels] (1-2 words each):
-- Thresholds: Evaluate against `high_price_threshold_cents` (overprice threshold) and `average_cents` (day's average).
-- Extremes: The period with the absolute maximum hourly price MUST be explicitly labeled "peak".
-- Constraint: Output ONLY the finalized 3-segment string.
+Guidelines:
+- Use precise, nuanced language to characterize the landscape curve (e.g., "sustained high plateau," "double-peak afternoon," "all-day sub-threshold pricing with an isolated evening spike").
+- Contextualize the 24-hour distribution against `high_price_threshold_cents` and `average_cents` to capture macro consumption windows or persistent extremes.
+- Constraint: Output ONLY the finalized summary sentence.
 
 
 {{EXTRA_PROMPT}}

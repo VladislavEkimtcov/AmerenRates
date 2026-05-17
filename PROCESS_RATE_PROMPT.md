@@ -22,15 +22,12 @@ Rules:
 
 For daily analysis, return exactly:
 
-Daily shape: one sentence on the overall pattern.
-Best windows: one sentence naming the best low-cost hours.
-Avoid: one sentence naming expensive hours or saying none.
+One sentence on the overall pattern. One sentence naming the best low-cost hours.
 
 For hourly analysis, return exactly:
 
-Action: one sentence with what to do for the next hour.
-Why: one sentence using the current hour price and nearby prices.
-Next move: one sentence naming when to reassess or shift usage.
+One sentence with what to do for the next hour considering the price trends.
+One sentence naming when to reassess or shift usage.
 
 {{EXTRA_PROMPT}}
 

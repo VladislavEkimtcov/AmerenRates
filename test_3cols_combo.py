@@ -52,13 +52,57 @@ class ComboFormattingTests(unittest.TestCase):
 
         self.assertEqual(seconds, 17.75)
 
-    def test_countdown_line_formats_time_until_refresh(self):
-        line = combo._countdown_line(
+    def test_bottom_bar_formats_seconds_until_refresh(self):
+        line = combo._bottom_bar_plain_text(
             datetime(2026, 4, 24, 3, 16, 0),
             now=datetime(2026, 4, 24, 3, 15, 18),
+            width=24,
         )
 
-        self.assertEqual(line, "Next refresh in 00:42")
+        self.assertEqual(line, " [i] Analysis       :42 ")
+
+    def test_needed_analysis_jobs_detects_daily_and_hourly_misses(self):
+        jobs = combo._needed_analysis_jobs({}, now=datetime(2026, 4, 24, 3, 15))
+
+        self.assertEqual(jobs, [("daily", "daily:2026-04-24"), ("hourly", "hourly:2026-04-24T03")])
+
+    def test_needed_analysis_jobs_detects_new_hour(self):
+        thoughts = {
+            "date": "2026-04-24",
+            "daily_statement": "Today is cheap overnight.",
+            "hour_key": "2026-04-24T02",
+            "hourly_statement": "Do laundry now.",
+        }
+
+        jobs = combo._needed_analysis_jobs(thoughts, now=datetime(2026, 4, 24, 3, 0))
+
+        self.assertEqual(jobs, [("hourly", "hourly:2026-04-24T03")])
+
+    def test_build_rate_prompt_includes_context_and_extra_prompt(self):
+        config = {"extra_prompt": "Mention EV charging."}
+        context = {"date": "2026-04-24", "hourly_prices": [{"hour": "03:00", "price_cents": 4.2}]}
+
+        prompt = combo.build_rate_prompt(
+            "Kind={{ANALYSIS_KIND}}\n{{EXTRA_PROMPT}}\n{{RATE_DATA}}",
+            "hourly",
+            context,
+            config,
+        )
+
+        self.assertIn("Kind=hourly", prompt)
+        self.assertIn("Mention EV charging.", prompt)
+        self.assertIn('"price_cents": 4.2', prompt)
+
+    def test_build_rate_analysis_context_marks_current_and_upcoming_hours(self):
+        details = [{"hour": f"{i:02d}", "price": 0.01 * (i + 1)} for i in range(24)]
+
+        context = combo.build_rate_analysis_context(details, now=datetime(2026, 4, 24, 3, 15))
+
+        self.assertEqual(context["date"], "2026-04-24")
+        self.assertEqual(context["hour_key"], "2026-04-24T03")
+        self.assertEqual(context["current_hour"]["hour"], "03:00")
+        self.assertEqual(context["current_hour"]["price_cents"], 4.0)
+        self.assertEqual(context["upcoming_hours"][0]["hour"], "03:00")
 
     def test_colorize_price_uses_scaled_bar_when_text_does_not_fit(self):
         rendered = combo.colorize_price(
@@ -238,6 +282,7 @@ class ComboFormattingTests(unittest.TestCase):
             mock.patch.object(combo, "fetch_or_load_rates", return_value={"hourlyPriceDetails": []}),
             mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=True),
             mock.patch.object(combo, "build_table", return_value=[["12:00", "¢1.0", ""]]),
+            mock.patch.object(combo, "ensure_rate_analysis_background"),
         ):
             combo.render_screen(
                 output=output,
@@ -245,7 +290,15 @@ class ComboFormattingTests(unittest.TestCase):
                 next_refresh_at=datetime(2026, 4, 24, 3, 16, 0),
             )
 
-        self.assertTrue(strip_ansi(output.getvalue()).endswith("Next refresh in 01:00"))
+        plain = strip_ansi(output.getvalue())
+        self.assertIn("[i] Analysis", plain)
+        self.assertTrue(plain.endswith(":60 "))
+
+    def test_analysis_display_explains_missing_config(self):
+        with mock.patch.object(combo, "load_rate_ai_config", return_value={"enabled": True, "model": ""}):
+            text = combo._analysis_display_text(now=datetime(2026, 4, 24, 3, 15))
+
+        self.assertIn("Analysis is not configured yet.", text)
 
     def test_main_runs_refresh_loop_by_default(self):
         with mock.patch.object(combo, "run_refresh_loop") as run_refresh_loop:

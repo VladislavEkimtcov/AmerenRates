@@ -300,6 +300,65 @@ class ComboFormattingTests(unittest.TestCase):
 
         self.assertIn("Analysis is not configured yet.", text)
 
+    def test_analysis_display_shows_latest_token_rate(self):
+        thoughts = {
+            "date": "2026-04-24",
+            "hour_key": "2026-04-24T03",
+            "analysis_status": "ready",
+            "analysis_error": "",
+            "model": "deepseek-r1:70b",
+            "daily_statement": "Daily summary.",
+            "daily_generated_at": "2026-04-24T03:14:04",
+            "daily_stats": {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2},
+            "hourly_statement": "Hourly summary.",
+            "hourly_generated_at": "2026-04-24T03:14:16",
+            "hourly_stats": {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4},
+        }
+
+        with (
+            mock.patch.object(combo, "load_rate_ai_config", return_value={"enabled": True, "model": "deepseek-r1:70b"}),
+            mock.patch.object(combo, "load_rate_thoughts", return_value=thoughts),
+        ):
+            text = combo._analysis_display_text(now=datetime(2026, 4, 24, 3, 15))
+
+        self.assertIn("Ready from deepseek-r1:70b at 12.3t/s.", text)
+
+    def test_run_rate_analysis_jobs_persists_stats(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = datetime(2026, 4, 24, 3, 15)
+            config = {
+                "endpoint": "http://127.0.0.1:6767/v1",
+                "api_key": "",
+                "model": "deepseek-r1:70b",
+                "temperature": 0.2,
+                "max_tokens": 700,
+                "extra_prompt": "",
+            }
+            responses = [
+                ("Daily summary.", {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2}),
+                ("Hourly summary.", {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4}),
+            ]
+
+            with (
+                mock.patch.object(combo, "BASE_DIR", Path(tmp)),
+                mock.patch.object(combo, "load_rate_prompt_template", return_value="Kind={{ANALYSIS_KIND}}\n{{RATE_DATA}}"),
+                mock.patch.object(combo, "build_rate_analysis_context", return_value={"hourly_prices": []}),
+                mock.patch.object(combo, "query_rate_llm", side_effect=responses),
+            ):
+                combo._run_rate_analysis_jobs(
+                    [{"hour": "03", "price": 0.042}],
+                    now,
+                    [("daily", "daily:2026-04-24"), ("hourly", "hourly:2026-04-24T03")],
+                    config,
+                )
+                thoughts = combo.load_rate_thoughts()
+
+        self.assertEqual(thoughts["analysis_status"], "ready")
+        self.assertEqual(thoughts["daily_statement"], "Daily summary.")
+        self.assertEqual(thoughts["daily_stats"], {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2})
+        self.assertEqual(thoughts["hourly_statement"], "Hourly summary.")
+        self.assertEqual(thoughts["hourly_stats"], {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4})
+
     def test_analysis_markdown_line_colors_headings_and_bold(self):
         rendered = combo._render_analysis_markdown_line("## **Hourly** action")
 

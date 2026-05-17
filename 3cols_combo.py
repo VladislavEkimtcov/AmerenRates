@@ -289,6 +289,14 @@ def _clean_llm_response(raw):
 	return text.replace("\\n", "\n").replace("\\t", "\t")
 
 
+def _llm_stats(response, elapsed):
+	tokens = 0
+	if getattr(response, "usage", None) and response.usage.completion_tokens:
+		tokens = response.usage.completion_tokens
+	tok_per_sec = tokens / elapsed if elapsed > 0 and tokens else 0.0
+	return {"tokens": tokens, "tok_per_sec": tok_per_sec, "elapsed": round(elapsed, 1)}
+
+
 def query_rate_llm(prompt, config):
 	from openai import OpenAI
 
@@ -296,13 +304,15 @@ def query_rate_llm(prompt, config):
 		base_url=config["endpoint"],
 		api_key=config["api_key"] or "not-needed",
 	)
+	t0 = time.monotonic()
 	response = client.chat.completions.create(
 		model=config["model"],
 		messages=[{"role": "user", "content": prompt}],
 		temperature=config["temperature"],
 		max_tokens=config["max_tokens"],
 	)
-	return _clean_llm_response(response.choices[0].message.content or "")
+	elapsed = time.monotonic() - t0
+	return _clean_llm_response(response.choices[0].message.content or ""), _llm_stats(response, elapsed)
 
 
 def _read_json_file(path, default):
@@ -396,6 +406,15 @@ def _needed_analysis_jobs(thoughts, now=None):
 	return jobs
 
 
+def _clear_stale_analysis_fields(thoughts, date_key, hour_key):
+	if thoughts.get("date") != date_key:
+		for key in ("daily_statement", "daily_generated_at", "daily_stats"):
+			thoughts.pop(key, None)
+	if thoughts.get("hour_key") != hour_key:
+		for key in ("hourly_statement", "hourly_generated_at", "hourly_stats"):
+			thoughts.pop(key, None)
+
+
 def ensure_rate_analysis_background(hourly_details, now=None):
 	now = now or datetime.now()
 	config = load_rate_ai_config()
@@ -431,12 +450,7 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config):
 		context = build_rate_analysis_context(hourly_details, now=now)
 		with RATE_ANALYSIS_LOCK:
 			thoughts = load_rate_thoughts()
-			if thoughts.get("date") != date_key:
-				thoughts.pop("daily_statement", None)
-				thoughts.pop("daily_generated_at", None)
-			if thoughts.get("hour_key") != hour_key:
-				thoughts.pop("hourly_statement", None)
-				thoughts.pop("hourly_generated_at", None)
+			_clear_stale_analysis_fields(thoughts, date_key, hour_key)
 			thoughts.update({
 				"date": date_key,
 				"hour_key": hour_key,
@@ -447,7 +461,7 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config):
 			save_rate_thoughts(thoughts)
 
 		for analysis_kind, _ in jobs:
-			statement = query_rate_llm(
+			statement, stats = query_rate_llm(
 				build_rate_prompt(template, analysis_kind, context, config),
 				config,
 			)
@@ -460,9 +474,11 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config):
 				if analysis_kind == "daily":
 					thoughts["daily_statement"] = statement
 					thoughts["daily_generated_at"] = datetime.now().isoformat(timespec="seconds")
+					thoughts["daily_stats"] = stats
 				else:
 					thoughts["hourly_statement"] = statement
 					thoughts["hourly_generated_at"] = datetime.now().isoformat(timespec="seconds")
+					thoughts["hourly_stats"] = stats
 				save_rate_thoughts(thoughts)
 
 		with RATE_ANALYSIS_LOCK:
@@ -755,7 +771,17 @@ def _analysis_display_text(now=None):
 	elif status == "error" and error:
 		sections.append(f"### Status\nLLM error: {error}")
 	elif thoughts.get("model"):
-		sections.append(f"### Status\nReady from {thoughts['model']}.")
+		stats_candidates = []
+		if thoughts.get("date") == date_key and isinstance(thoughts.get("daily_stats"), dict):
+			stats_candidates.append((thoughts.get("daily_generated_at", ""), thoughts["daily_stats"]))
+		if thoughts.get("hour_key") == hour_key and isinstance(thoughts.get("hourly_stats"), dict):
+			stats_candidates.append((thoughts.get("hourly_generated_at", ""), thoughts["hourly_stats"]))
+		latest_stats = max(stats_candidates, default=("", {}))[1]
+		tok_per_sec = latest_stats.get("tok_per_sec") if isinstance(latest_stats, dict) else 0
+		if tok_per_sec:
+			sections.append(f"### Status\nReady from {thoughts['model']} at {tok_per_sec:.1f}t/s.")
+		else:
+			sections.append(f"### Status\nReady from {thoughts['model']}.")
 
 	return "\n\n".join(sections)
 

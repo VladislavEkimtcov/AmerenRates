@@ -39,11 +39,20 @@ BG_YELLOW = '\033[43m'
 BG_RED = '\033[41m'
 BG_WHITE = '\033[47m'
 BG_BLUE = '\033[44m'
+BG_CYAN = '\033[46m'
 RESET = '\033[0m'
 CENT = '¢'
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 CLEAR_SCREEN = "\033[2J\033[H"
 CLEAR_LINE = "\033[2K"
+KEY_UP = "UP"
+KEY_DOWN = "DOWN"
+KEY_PAGE_UP = "PAGE_UP"
+KEY_PAGE_DOWN = "PAGE_DOWN"
+KEY_MOUSE_UP = "MOUSE_UP"
+KEY_MOUSE_DOWN = "MOUSE_DOWN"
+MOUSE_ENABLE = "\033[?1000h\033[?1006h"
+MOUSE_DISABLE = "\033[?1000l\033[?1006l"
 REFRESH_SECONDS = 60
 BASE_DIR = Path(__file__).resolve().parent
 RATE_ANALYSIS_LOCK = threading.Lock()
@@ -599,10 +608,31 @@ def _bottom_bar_line(next_refresh_at, now=None, width=None):
 	return f"{BG_BLUE}{WHITE}{_bottom_bar_plain_text(next_refresh_at, now=now, width=width)}{RESET}"
 
 
+def _analysis_bottom_bar_plain_text(next_refresh_at, now=None, width=None):
+	now = now or datetime.now()
+	remaining = (next_refresh_at - now).total_seconds()
+	width = width or _terminal_size()[0]
+	left = " [i] Rates  ↑↓ Scroll "
+	right = f" {_format_refresh_seconds(remaining)} "
+	padding = max(1, width - _visible_width(left) - len(right))
+	return (left + (" " * padding) + right)[:width]
+
+
+def _analysis_bottom_bar_line(next_refresh_at, now=None, width=None):
+	return f"{BG_BLUE}{WHITE}{_analysis_bottom_bar_plain_text(next_refresh_at, now=now, width=width)}{RESET}"
+
+
 def _write_bottom_bar(next_refresh_at, output=None, now=None):
 	output = output or sys.stdout
 	width, height = _terminal_size()
 	output.write(f"\033[{height};1H\r{CLEAR_LINE}{_bottom_bar_line(next_refresh_at, now=now, width=width)}")
+	output.flush()
+
+
+def _write_analysis_bottom_bar(next_refresh_at, output=None, now=None):
+	output = output or sys.stdout
+	width, height = _terminal_size()
+	output.write(f"\033[{height};1H\r{CLEAR_LINE}{_analysis_bottom_bar_line(next_refresh_at, now=now, width=width)}")
 	output.flush()
 
 
@@ -638,6 +668,10 @@ def _update_countdown_line(next_refresh_at, output=None):
 	_write_bottom_bar(next_refresh_at, output=output)
 
 
+def _update_analysis_countdown_line(next_refresh_at, output=None):
+	_write_analysis_bottom_bar(next_refresh_at, output=output)
+
+
 def _wrap_analysis_text(text, width):
 	lines = []
 	for paragraph in text.splitlines():
@@ -646,6 +680,45 @@ def _wrap_analysis_text(text, width):
 		else:
 			lines.extend(textwrap.wrap(paragraph, width=max(20, width)) or [""])
 	return lines
+
+
+def _apply_inline_markdown(line, base_style=""):
+	if "**" not in line:
+		return f"{base_style}{line}{RESET}" if base_style else line
+
+	parts = line.split("**")
+	rendered = []
+	for index, part in enumerate(parts):
+		if not part:
+			continue
+		style = f"{base_style}{BOLD}" if index % 2 else base_style
+		rendered.append(f"{style}{part}{RESET}" if style else part)
+	return "".join(rendered)
+
+
+def _render_analysis_markdown_line(line):
+	stripped = line.lstrip()
+	indent = line[:len(line) - len(stripped)]
+	base_style = ""
+
+	if stripped.startswith("###"):
+		base_style = f"{BG_GREEN}{BLACK}{BOLD}"
+		stripped = stripped[4:] if stripped.startswith("### ") else stripped[3:]
+	elif stripped.startswith("##"):
+		base_style = f"{BG_BLUE}{WHITE}{BOLD}"
+		stripped = stripped[3:] if stripped.startswith("## ") else stripped[2:]
+	elif stripped.startswith("#"):
+		base_style = f"{BG_CYAN}{BLACK}{BOLD}"
+		stripped = stripped[2:] if stripped.startswith("# ") else stripped[1:]
+	elif stripped.startswith("*") and not stripped.startswith("**"):
+		stripped = "•" + stripped[1:]
+
+	return _apply_inline_markdown(f"{indent}{stripped}", base_style=base_style)
+
+
+def _analysis_lines(now=None, width=None):
+	width = width or _terminal_size()[0]
+	return _wrap_analysis_text(_analysis_display_text(now=now), width - 1)
 
 
 def _analysis_display_text(now=None):
@@ -668,41 +741,72 @@ def _analysis_display_text(now=None):
 
 	sections = []
 	if hourly:
-		sections.append(f"Hourly action ({hour_key})\n{hourly}")
+		sections.append(f"## Hourly action ({hour_key})\n{hourly}")
 	else:
-		sections.append(f"Hourly action ({hour_key})\nAnalysis is warming up.")
+		sections.append(f"## Hourly action ({hour_key})\nAnalysis is warming up.")
 
 	if daily:
-		sections.append(f"Daily analysis ({date_key})\n{daily}")
+		sections.append(f"## Daily analysis ({date_key})\n{daily}")
 	else:
-		sections.append(f"Daily analysis ({date_key})\nAnalysis is warming up.")
+		sections.append(f"## Daily analysis ({date_key})\nAnalysis is warming up.")
 
 	if status == "running":
-		sections.append("Status\nGenerating in the background.")
+		sections.append("### Status\nGenerating in the background.")
 	elif status == "error" and error:
-		sections.append(f"Status\nLLM error: {error}")
+		sections.append(f"### Status\nLLM error: {error}")
 	elif thoughts.get("model"):
-		sections.append(f"Status\nReady from {thoughts['model']}.")
+		sections.append(f"### Status\nReady from {thoughts['model']}.")
 
 	return "\n\n".join(sections)
 
 
-def render_analysis_screen(output=None, clear_screen=False, next_refresh_at=None, now=None):
+def render_analysis_screen(output=None, clear_screen=False, next_refresh_at=None, now=None, scroll=0):
 	output = output or sys.stdout
 	now = now or datetime.now()
 	width, height = _terminal_size()
 	body_height = max(1, height - 2)
-	lines = _wrap_analysis_text(_analysis_display_text(now=now), width - 1)
+	lines = _analysis_lines(now=now, width=width)
+	max_scroll = max(0, len(lines) - body_height)
+	scroll = min(max(0, scroll), max_scroll)
 
 	if clear_screen:
 		print(CLEAR_SCREEN, end="", file=output)
 
-	for line in lines[:body_height]:
-		print(line[:width - 1], file=output)
+	for line in lines[scroll:scroll + body_height]:
+		print(_render_analysis_markdown_line(line[:width - 1]), file=output)
 
 	if next_refresh_at is not None:
-		_write_bottom_bar(next_refresh_at, output=output, now=now)
+		_write_analysis_bottom_bar(next_refresh_at, output=output, now=now)
 	output.flush()
+	return max_scroll
+
+
+def _decode_terminal_key(sequence):
+	if sequence in {"\x1b[A", "\x1bOA"}:
+		return KEY_UP
+	if sequence in {"\x1b[B", "\x1bOB"}:
+		return KEY_DOWN
+	if sequence == "\x1b[5~":
+		return KEY_PAGE_UP
+	if sequence == "\x1b[6~":
+		return KEY_PAGE_DOWN
+
+	mouse_match = re.match(r"\x1b\[<(\d+);\d+;\d+([mM])", sequence)
+	if mouse_match:
+		button = int(mouse_match.group(1))
+		if button == 64:
+			return KEY_MOUSE_UP
+		if button == 65:
+			return KEY_MOUSE_DOWN
+
+	if sequence.startswith("\x1b[M") and len(sequence) >= 6:
+		button = ord(sequence[3]) - 32
+		if button == 64:
+			return KEY_MOUSE_UP
+		if button == 65:
+			return KEY_MOUSE_DOWN
+
+	return sequence
 
 
 @contextmanager
@@ -719,42 +823,66 @@ def terminal_key_reader(input_stream=None):
 	fd = input_stream.fileno()
 	old_settings = termios.tcgetattr(fd)
 	tty.setcbreak(fd)
+	sys.stdout.write(MOUSE_ENABLE)
+	sys.stdout.flush()
 	try:
 		def read_key(timeout=0):
 			ready, _, _ = select.select([input_stream], [], [], timeout)
 			if not ready:
 				return ""
-			return input_stream.read(1)
+			first = input_stream.read(1)
+			if first != "\x1b":
+				return first
+
+			sequence = [first]
+			while True:
+				ready, _, _ = select.select([input_stream], [], [], 0.01)
+				if not ready:
+					break
+				sequence.append(input_stream.read(1))
+				joined = "".join(sequence)
+				if re.match(r"\x1b\[(?:[AB]|[56]~)$", joined):
+					break
+				if re.match(r"\x1b\[<\d+;\d+;\d+[mM]$", joined):
+					break
+				if joined.startswith("\x1b[M") and len(joined) >= 6:
+					break
+			return _decode_terminal_key("".join(sequence))
 
 		yield read_key
 	finally:
+		sys.stdout.write(MOUSE_DISABLE)
+		sys.stdout.flush()
 		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def _refresh_screen(view_mode, args, output, next_refresh_at):
+def _refresh_screen(view_mode, args, output, next_refresh_at, analysis_scroll=0):
 	if view_mode == "analysis":
 		data = fetch_or_load_rates()
 		apply_price_to_compare_threshold()
 		hourly_details = data.get("hourlyPriceDetails") or []
 		ensure_rate_analysis_background(hourly_details)
-		render_analysis_screen(
+		return render_analysis_screen(
 			output=output,
 			clear_screen=True,
 			next_refresh_at=next_refresh_at,
+			scroll=analysis_scroll,
 		)
-	else:
-		render_screen(
-			bar=args.bar,
-			output=output,
-			clear_screen=True,
-			next_refresh_at=next_refresh_at,
-		)
+	render_screen(
+		bar=args.bar,
+		output=output,
+		clear_screen=True,
+		next_refresh_at=next_refresh_at,
+	)
+	return 0
 
 
 def run_refresh_loop(args, output=None):
 	output = output or sys.stdout
 	next_delay = seconds_until_next_minute()
 	view_mode = "rates"
+	analysis_scroll = 0
+	analysis_max_scroll = 0
 
 	with terminal_key_reader() as read_key:
 		while True:
@@ -765,16 +893,72 @@ def run_refresh_loop(args, output=None):
 			timer.start()
 
 			try:
-				_refresh_screen(view_mode, args, output, next_refresh_at)
+				analysis_max_scroll = _refresh_screen(
+					view_mode,
+					args,
+					output,
+					next_refresh_at,
+					analysis_scroll=analysis_scroll,
+				)
 				while not refresh_ready.is_set():
-					_update_countdown_line(next_refresh_at, output=output)
+					if view_mode == "analysis":
+						_update_analysis_countdown_line(next_refresh_at, output=output)
+					else:
+						_update_countdown_line(next_refresh_at, output=output)
 					key = read_key(timeout=1)
 					if key in {"i", "I"}:
 						view_mode = "analysis" if view_mode == "rates" else "rates"
-						_refresh_screen(view_mode, args, output, next_refresh_at)
+						if view_mode == "analysis":
+							analysis_scroll = 0
+						analysis_max_scroll = _refresh_screen(
+							view_mode,
+							args,
+							output,
+							next_refresh_at,
+							analysis_scroll=analysis_scroll,
+						)
+					elif view_mode == "analysis" and key in {KEY_UP, KEY_MOUSE_UP}:
+						step = 3 if key == KEY_MOUSE_UP else 1
+						analysis_scroll = max(0, analysis_scroll - step)
+						analysis_max_scroll = render_analysis_screen(
+							output=output,
+							clear_screen=True,
+							next_refresh_at=next_refresh_at,
+							scroll=analysis_scroll,
+						)
+					elif view_mode == "analysis" and key in {KEY_DOWN, KEY_MOUSE_DOWN}:
+						step = 3 if key == KEY_MOUSE_DOWN else 1
+						analysis_scroll = min(analysis_max_scroll, analysis_scroll + step)
+						analysis_max_scroll = render_analysis_screen(
+							output=output,
+							clear_screen=True,
+							next_refresh_at=next_refresh_at,
+							scroll=analysis_scroll,
+						)
+					elif view_mode == "analysis" and key == KEY_PAGE_UP:
+						_, height = _terminal_size()
+						analysis_scroll = max(0, analysis_scroll - max(1, height - 3))
+						analysis_max_scroll = render_analysis_screen(
+							output=output,
+							clear_screen=True,
+							next_refresh_at=next_refresh_at,
+							scroll=analysis_scroll,
+						)
+					elif view_mode == "analysis" and key == KEY_PAGE_DOWN:
+						_, height = _terminal_size()
+						analysis_scroll = min(analysis_max_scroll, analysis_scroll + max(1, height - 3))
+						analysis_max_scroll = render_analysis_screen(
+							output=output,
+							clear_screen=True,
+							next_refresh_at=next_refresh_at,
+							scroll=analysis_scroll,
+						)
 					elif key in {"q", "Q"}:
 						return
-				_update_countdown_line(next_refresh_at, output=output)
+				if view_mode == "analysis":
+					_update_analysis_countdown_line(next_refresh_at, output=output)
+				else:
+					_update_countdown_line(next_refresh_at, output=output)
 			finally:
 				timer.cancel()
 

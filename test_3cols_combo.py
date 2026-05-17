@@ -300,6 +300,34 @@ class ComboFormattingTests(unittest.TestCase):
 
         self.assertIn("Analysis is not configured yet.", text)
 
+    def test_analysis_markdown_line_colors_headings_and_bold(self):
+        rendered = combo._render_analysis_markdown_line("## **Hourly** action")
+
+        self.assertIn(combo.BG_BLUE, rendered)
+        self.assertIn(combo.BOLD, rendered)
+        self.assertEqual(strip_ansi(rendered), "Hourly action")
+
+    def test_decode_terminal_key_handles_arrows_and_mouse_wheel(self):
+        self.assertEqual(combo._decode_terminal_key("\x1b[A"), combo.KEY_UP)
+        self.assertEqual(combo._decode_terminal_key("\x1b[B"), combo.KEY_DOWN)
+        self.assertEqual(combo._decode_terminal_key("\x1b[<64;10;5M"), combo.KEY_MOUSE_UP)
+        self.assertEqual(combo._decode_terminal_key("\x1b[<65;10;5M"), combo.KEY_MOUSE_DOWN)
+
+    def test_render_analysis_screen_scrolls_statement(self):
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(combo, "_terminal_size", return_value=(40, 6)),
+            mock.patch.object(combo, "_analysis_display_text", return_value="# Top\nline1\nline2\nline3\nline4\nline5"),
+        ):
+            max_scroll = combo.render_analysis_screen(output=output, scroll=2)
+
+        plain = strip_ansi(output.getvalue())
+        self.assertEqual(max_scroll, 2)
+        self.assertNotIn("Top", plain)
+        self.assertIn("line2", plain)
+        self.assertIn("line5", plain)
+
     def test_main_runs_refresh_loop_by_default(self):
         with mock.patch.object(combo, "run_refresh_loop") as run_refresh_loop:
             combo.main([])

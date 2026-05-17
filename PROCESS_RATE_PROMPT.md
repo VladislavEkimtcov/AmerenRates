@@ -19,12 +19,15 @@ Rules:
 6. Do not claim access to data outside the RATE DATA block.
 
 For hourly analysis, return exactly:
+A single, direct sentence (max 15 words) recommending immediate load-shifting action.
 
-One short sentence on the current vector.
+For daily analysis, return exactly this string template:
+"[Morning Label] morning, [Day Label] day, [Afternoon Label] afternoon"
 
-For daily analysis, return exactly:
-
-"X morning, Y day, Z afternoon" structure sentence where X, Y, and Z are short, punchy one or two word descriptions of the day's period.
+Rules for [Labels] (1-2 words each):
+- Thresholds: Evaluate against `high_price_threshold_cents`. Use "high" if above, "low" if below both threshold and daily average.
+- Extremes: The period with the absolute maximum hourly price MUST be explicitly labeled "peak".
+- Constraint: Output ONLY the finalized 3-segment string.
 
 
 {{EXTRA_PROMPT}}

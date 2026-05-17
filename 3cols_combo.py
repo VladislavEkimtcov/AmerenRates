@@ -5,9 +5,12 @@ DEFAULT_bar = 5
 
 import argparse
 import json
+import math
 import os
 import re
-from datetime import datetime
+import sys
+import threading
+from datetime import datetime, timedelta
 
 import requests
 
@@ -28,6 +31,9 @@ BG_WHITE = '\033[47m'
 RESET = '\033[0m'
 CENT = '¢'
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+CLEAR_SCREEN = "\033[2J\033[H"
+CLEAR_LINE = "\033[2K"
+REFRESH_SECONDS = 60
 
 
 def _color_for_price(price, thresholds, is_max=False):
@@ -264,6 +270,76 @@ def _positive_int(value):
 	return parsed
 
 
+def seconds_until_next_minute(now=None):
+	now = now or datetime.now()
+	next_minute = (now + timedelta(minutes=1)).replace(second=0, microsecond=0)
+	return max(0.0, (next_minute - now).total_seconds())
+
+
+def _format_countdown(seconds_remaining):
+	total_seconds = max(0, int(math.ceil(seconds_remaining)))
+	minutes, seconds = divmod(total_seconds, 60)
+	return f"{minutes:02}:{seconds:02}"
+
+
+def _countdown_line(next_refresh_at, now=None):
+	now = now or datetime.now()
+	remaining = (next_refresh_at - now).total_seconds()
+	return f"Next refresh in {_format_countdown(remaining)}"
+
+
+def render_screen(bar=DEFAULT_bar, output=None, clear_screen=False, next_refresh_at=None, now=None):
+	output = output or sys.stdout
+	now = now or datetime.now()
+
+	if clear_screen:
+		print(CLEAR_SCREEN, end="", file=output)
+
+	data = fetch_or_load_rates()
+	ptc_loaded = apply_price_to_compare_threshold()
+	hourly_details = data.get("hourlyPriceDetails") or []
+	table = build_table(hourly_details, now=now, bar=bar)
+	print(_format_plain_table(table, headers=["Hour", "AM", "PM"]), file=output)
+	if not ptc_loaded:
+		print(f"{RED}PTC FETCH FAILURE{RESET}", file=output)
+	if next_refresh_at is not None:
+		print(_countdown_line(next_refresh_at, now=now), end="", file=output)
+	output.flush()
+
+
+def _update_countdown_line(next_refresh_at, output=None):
+	output = output or sys.stdout
+	output.write(f"\r{CLEAR_LINE}{_countdown_line(next_refresh_at)}")
+	output.flush()
+
+
+def run_refresh_loop(args, output=None):
+	output = output or sys.stdout
+	next_delay = seconds_until_next_minute()
+
+	while True:
+		next_refresh_at = datetime.now() + timedelta(seconds=next_delay)
+		refresh_ready = threading.Event()
+		timer = threading.Timer(next_delay, refresh_ready.set)
+		timer.daemon = True
+		timer.start()
+
+		try:
+			render_screen(
+				bar=args.bar,
+				output=output,
+				clear_screen=True,
+				next_refresh_at=next_refresh_at,
+			)
+			while not refresh_ready.wait(timeout=1):
+				_update_countdown_line(next_refresh_at, output=output)
+			_update_countdown_line(next_refresh_at, output=output)
+		finally:
+			timer.cancel()
+
+		next_delay = REFRESH_SECONDS
+
+
 def parse_args(argv=None):
 	parser = argparse.ArgumentParser(description="Show Ameren hourly rates with prices overlaid on bars.")
 	parser.add_argument(
@@ -272,22 +348,26 @@ def parse_args(argv=None):
 		default=DEFAULT_bar,
 		help=f"Maximum width used to scale the colored bars (default: {DEFAULT_bar})",
 	)
+	parser.add_argument(
+		"--once",
+		action="store_true",
+		help="Render once and exit instead of refreshing every minute.",
+	)
 	return parser.parse_args(argv)
 
 
 def main(argv=None):
 	args = parse_args(argv)
-	data = fetch_or_load_rates()
-	ptc_loaded = apply_price_to_compare_threshold()
-	hourly_details = data.get("hourlyPriceDetails") or []
-	table = build_table(hourly_details, bar=args.bar)
-	print(_format_plain_table(table, headers=["Hour", "AM", "PM"]))
-	if not ptc_loaded:
-		print(f"{RED}PTC FETCH FAILURE{RESET}")
+	if args.once:
+		render_screen(bar=args.bar)
+		return
+	run_refresh_loop(args)
 
 
 if __name__ == "__main__":
 	try:
 		main()
+	except KeyboardInterrupt:
+		print("\nStopped.")
 	except Exception as e:
 		print(f"Error: {e}")

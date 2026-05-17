@@ -37,10 +37,28 @@ class ComboFormattingTests(unittest.TestCase):
     def test_parse_args_uses_default_bar(self):
         args = combo.parse_args([])
         self.assertEqual(args.bar, 5)
+        self.assertFalse(args.once)
 
     def test_parse_args_allows_bar_override(self):
         args = combo.parse_args(["-bar", "9"])
         self.assertEqual(args.bar, 9)
+
+    def test_parse_args_allows_one_shot_mode(self):
+        args = combo.parse_args(["--once"])
+        self.assertTrue(args.once)
+
+    def test_seconds_until_next_minute_counts_to_next_minute_boundary(self):
+        seconds = combo.seconds_until_next_minute(datetime(2026, 4, 24, 3, 15, 42, 250000))
+
+        self.assertEqual(seconds, 17.75)
+
+    def test_countdown_line_formats_time_until_refresh(self):
+        line = combo._countdown_line(
+            datetime(2026, 4, 24, 3, 16, 0),
+            now=datetime(2026, 4, 24, 3, 15, 18),
+        )
+
+        self.assertEqual(line, "Next refresh in 00:42")
 
     def test_colorize_price_uses_scaled_bar_when_text_does_not_fit(self):
         rendered = combo.colorize_price(
@@ -207,11 +225,33 @@ class ComboFormattingTests(unittest.TestCase):
             mock.patch.object(combo, "build_table", return_value=[["12:00", "¢1.0", ""]]),
             redirect_stdout(output),
         ):
-            combo.main([])
+            combo.main(["--once"])
 
         lines = strip_ansi(output.getvalue()).splitlines()
         self.assertEqual(lines[0], "Hour  AM   PM")
         self.assertEqual(lines[-1], "PTC FETCH FAILURE")
+
+    def test_render_screen_prints_countdown_at_bottom(self):
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(combo, "fetch_or_load_rates", return_value={"hourlyPriceDetails": []}),
+            mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=True),
+            mock.patch.object(combo, "build_table", return_value=[["12:00", "¢1.0", ""]]),
+        ):
+            combo.render_screen(
+                output=output,
+                now=datetime(2026, 4, 24, 3, 15, 0),
+                next_refresh_at=datetime(2026, 4, 24, 3, 16, 0),
+            )
+
+        self.assertTrue(strip_ansi(output.getvalue()).endswith("Next refresh in 01:00"))
+
+    def test_main_runs_refresh_loop_by_default(self):
+        with mock.patch.object(combo, "run_refresh_loop") as run_refresh_loop:
+            combo.main([])
+
+        run_refresh_loop.assert_called_once()
 
 
 if __name__ == "__main__":

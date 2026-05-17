@@ -25,7 +25,7 @@ For daily analysis, return exactly this string template:
 "[Morning Label] morning, [Day Label] day, [Afternoon Label] afternoon"
 
 Rules for [Labels] (1-2 words each):
-- Thresholds: Evaluate against `high_price_threshold_cents`. Use "high" if above, "low" if below both threshold and daily average.
+- Thresholds: Evaluate against `high_price_threshold_cents` (overprice threshold) and `average_cents` (day's average).
 - Extremes: The period with the absolute maximum hourly price MUST be explicitly labeled "peak".
 - Constraint: Output ONLY the finalized 3-segment string.
 

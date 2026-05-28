@@ -89,7 +89,7 @@ class ComboFormattingTests(unittest.TestCase):
             width=32,
         )
 
-        self.assertEqual(line, " [i] AI [t] Later        :42 ")
+        self.assertEqual(line, " [i] AI [t] Later           :42 ")
 
     def test_bottom_bar_switches_label_on_tomorrow_view(self):
         line = combo._bottom_bar_plain_text(
@@ -317,6 +317,43 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertEqual(data, {"hourlyPriceDetails": [{"hour": "00", "price": 0.01}]})
         get_ptc.assert_not_called()
 
+    def test_fetch_or_load_rates_uses_cached_today_data_when_network_is_down(self):
+        now = datetime(2026, 5, 27, 9, 15)
+        today_payload = {"hourlyPriceDetails": [{"hour": "01", "price": 0.01}]}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "cached_rates.json"
+            cache_filename.write_text(json.dumps({
+                "date": now.date().isoformat(),
+                "data": today_payload,
+            }))
+
+            with (
+                mock.patch.object(combo, "CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo.requests, "post", side_effect=combo.requests.ConnectionError("offline")),
+            ):
+                data = combo.fetch_or_load_rates(now=now)
+
+        self.assertEqual(data, today_payload)
+
+    def test_fetch_or_load_rates_records_network_failure_when_offline_without_cache(self):
+        now = datetime(2026, 5, 27, 9, 15)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "cached_rates.json"
+
+            with (
+                mock.patch.object(combo, "CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo.requests, "post", side_effect=combo.requests.ConnectionError("offline")),
+            ):
+                data = combo.fetch_or_load_rates(now=now)
+                cached = json.loads(cache_filename.read_text())
+
+        self.assertIsNone(data)
+        self.assertEqual(cached["date"], now.date().isoformat())
+        self.assertEqual(cached["error_kind"], "network")
+        self.assertIsNone(cached["data"])
+
     def test_fetch_or_load_tomorrow_rates_caches_available_next_day_data(self):
         now = datetime(2026, 5, 27, 9, 15)
         tomorrow = now.date() + timedelta(days=1)
@@ -349,7 +386,7 @@ class ComboFormattingTests(unittest.TestCase):
         })
         iso_success = TomorrowRatesResponse(tomorrow)
 
-        def post_side_effect(url, json):
+        def post_side_effect(url, json, timeout=None):
             requests_seen.append(json["SelectedDate"])
             if json["SelectedDate"] == tomorrow.strftime("%B %d, %Y"):
                 return display_false_negative
@@ -418,9 +455,11 @@ class ComboFormattingTests(unittest.TestCase):
 
     def test_main_prints_ptc_failure_after_table(self):
         output = io.StringIO()
+        today_data = {"hourlyPriceDetails": [{"hour": "01", "price": 0.01}]}
 
         with (
-            mock.patch.object(combo, "fetch_or_load_rates", return_value={"hourlyPriceDetails": []}),
+            mock.patch.object(combo, "fetch_or_load_rates", return_value=today_data),
+            mock.patch.object(combo, "fetch_or_load_tomorrow_rates", return_value=None),
             mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=False),
             mock.patch.object(combo, "build_table", return_value=[["12:00", "¢1.0", ""]]),
             redirect_stdout(output),
@@ -433,9 +472,11 @@ class ComboFormattingTests(unittest.TestCase):
 
     def test_render_screen_prints_countdown_at_bottom(self):
         output = io.StringIO()
+        today_data = {"hourlyPriceDetails": [{"hour": "01", "price": 0.01}]}
 
         with (
-            mock.patch.object(combo, "fetch_or_load_rates", return_value={"hourlyPriceDetails": []}),
+            mock.patch.object(combo, "fetch_or_load_rates", return_value=today_data),
+            mock.patch.object(combo, "fetch_or_load_tomorrow_rates", return_value=None),
             mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=True),
             mock.patch.object(combo, "build_table", return_value=[["12:00", "¢1.0", ""]]),
             mock.patch.object(combo, "ensure_rate_analysis_background"),
@@ -450,6 +491,29 @@ class ComboFormattingTests(unittest.TestCase):
         plain = strip_ansi(output.getvalue())
         self.assertIn("[i] AI [t] Later", plain)
         self.assertTrue(plain.endswith(":60 "))
+
+    def test_render_screen_shows_no_internet_warning_when_today_rates_are_missing(self):
+        output = io.StringIO()
+
+        def cache_entry_side_effect(*args, **kwargs):
+            if kwargs.get("require_next_day"):
+                return {}
+            return {"error_kind": "network"}
+
+        with (
+            mock.patch.object(combo, "fetch_or_load_rates", return_value=None),
+            mock.patch.object(combo, "fetch_or_load_tomorrow_rates", return_value=None),
+            mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=True),
+            mock.patch.object(combo, "ensure_rate_analysis_background"),
+            mock.patch.object(combo, "_load_rate_cache_entry", side_effect=cache_entry_side_effect),
+        ):
+            combo.render_screen(
+                output=output,
+                now=datetime(2026, 4, 24, 3, 15, 0),
+                rate_view="today",
+            )
+
+        self.assertIn("NO INTERNET - no cached today rates available.", strip_ansi(output.getvalue()))
 
     def test_render_screen_shows_tomorrow_unavailable_message(self):
         output = io.StringIO()
@@ -543,6 +607,19 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertIn("Tomorrow outlook (2026-04-25)", text)
         self.assertIn("Tomorrow spikes in the evening.", text)
 
+    def test_analysis_display_reports_offline_missing_rates(self):
+        with (
+            mock.patch.object(combo, "load_rate_ai_config", return_value={"enabled": True, "model": "deepseek-r1:70b"}),
+            mock.patch.object(combo, "load_rate_thoughts", return_value={"analysis_status": "idle", "analysis_error": "", "model": "deepseek-r1:70b"}),
+            mock.patch.object(combo, "load_cached_rates", return_value=None),
+            mock.patch.object(combo, "load_cached_tomorrow_rates", return_value=None),
+            mock.patch.object(combo, "_load_rate_cache_entry", side_effect=[{"error_kind": "network"}, {"error_kind": "network"}]),
+        ):
+            text = combo._analysis_display_text(now=datetime(2026, 4, 24, 3, 15))
+
+        self.assertIn("NO INTERNET - no cached today rates available.", text)
+        self.assertIn("NO INTERNET - no cached tomorrow rates available.", text)
+
     def test_run_rate_analysis_jobs_persists_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
             now = datetime(2026, 4, 24, 3, 15)
@@ -616,6 +693,27 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertNotIn("Top", plain)
         self.assertIn("line2", plain)
         self.assertIn("line5", plain)
+
+    def test_refresh_screen_handles_missing_today_rates_without_crashing(self):
+        args = mock.Mock(bar=5)
+
+        with (
+            mock.patch.object(combo, "fetch_or_load_rates", return_value=None),
+            mock.patch.object(combo, "fetch_or_load_tomorrow_rates", return_value=None),
+            mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=True),
+            mock.patch.object(combo, "ensure_rate_analysis_background"),
+            mock.patch.object(combo, "render_screen", return_value=None) as render_screen,
+        ):
+            result = combo._refresh_screen(
+                "rates",
+                "today",
+                args,
+                io.StringIO(),
+                datetime(2026, 4, 24, 3, 16, 0),
+            )
+
+        self.assertEqual(result, 0)
+        render_screen.assert_called_once()
 
     def test_main_runs_refresh_loop_by_default(self):
         with mock.patch.object(combo, "run_refresh_loop") as run_refresh_loop:

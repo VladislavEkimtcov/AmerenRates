@@ -55,11 +55,13 @@ KEY_MOUSE_DOWN = "MOUSE_DOWN"
 MOUSE_ENABLE = "\033[?1000h\033[?1006h"
 MOUSE_DISABLE = "\033[?1000l\033[?1006l"
 REFRESH_SECONDS = 60
+REQUEST_TIMEOUT_SECONDS = 50
 BASE_DIR = Path(__file__).resolve().parent
 RATE_ANALYSIS_LOCK = threading.RLock()
 RATE_ANALYSIS_IN_FLIGHT = set()
 RATE_ANALYSIS_QUEUE = []
 RATE_ANALYSIS_WORKER = None
+UNSET = object()
 
 
 def _color_for_price(price, thresholds, is_max=False):
@@ -244,11 +246,75 @@ def _save_rate_cache(filename, payload):
 		f.write("\n")
 
 
+def _rate_fetch_failure_payload(
+	target_date_iso,
+	target_display,
+	checked_at,
+	last_checked_hour,
+	attempted_formats,
+	error,
+	error_kind,
+	require_next_day=False,
+):
+	payload = {
+		"date": target_date_iso,
+		"requestedDate": target_display,
+		"checked_at": checked_at,
+		"last_checked_hour": last_checked_hour,
+		"attempted_formats": attempted_formats,
+		"data": None,
+		"error": error,
+		"error_kind": error_kind,
+	}
+	if require_next_day:
+		payload["available"] = False
+	return payload
+
+
 def _fetch_rates_for_date(target_date, request_format):
 	payloads = dict(_selected_date_payloads(target_date))
 	selected_date = payloads[request_format]
-	response = requests.post(RATES_URL, json={"SelectedDate": selected_date})
+	response = requests.post(
+		RATES_URL,
+		json={"SelectedDate": selected_date},
+		timeout=REQUEST_TIMEOUT_SECONDS,
+	)
 	return response, selected_date
+
+
+def load_cached_rates(target_date=None, cache_filename=None, require_next_day=False, now=None):
+	now = now or datetime.now()
+	target_date = target_date or now.date()
+	cache_filename = cache_filename or (TOMORROW_CACHE_FILENAME if require_next_day else CACHE_FILENAME)
+	target_date_iso, _ = _target_day_parts(target_date)
+	cached = _load_rate_cache(cache_filename)
+	if cached.get("date") != target_date_iso:
+		return None
+	data = cached.get("data")
+	if require_next_day:
+		return data if _has_complete_next_day_rates(data, target_date_iso) else None
+	return data if data is not None else None
+
+
+def _load_rate_cache_entry(target_date=None, cache_filename=None, require_next_day=False, now=None):
+	now = now or datetime.now()
+	target_date = target_date or now.date()
+	cache_filename = cache_filename or (TOMORROW_CACHE_FILENAME if require_next_day else CACHE_FILENAME)
+	target_date_iso, _ = _target_day_parts(target_date)
+	cached = _load_rate_cache(cache_filename)
+	return cached if cached.get("date") == target_date_iso else {}
+
+
+def _rate_unavailable_text(day_label, error_kind="", require_next_day=False):
+	if error_kind == "network":
+		return "NO INTERNET - no cached {} rates available.".format(day_label)
+	if require_next_day:
+		return "Tomorrow rates are not available yet."
+	return "{} rates are not available.".format(day_label.capitalize())
+
+
+def _rate_unavailable_notice(day_label, error_kind="", require_next_day=False):
+	return "{}{}{}".format(RED, _rate_unavailable_text(day_label, error_kind, require_next_day=require_next_day), RESET)
 
 
 def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=False, now=None):
@@ -274,17 +340,31 @@ def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=
 	attempted_formats = []
 	last_response = None
 	last_error = ""
+	last_error_kind = ""
 
 	for request_format, _ in _selected_date_payloads(target_date):
-		response, requested_date = _fetch_rates_for_date(target_date, request_format)
-		last_response = response
 		attempted_formats.append(request_format)
+		try:
+			response, requested_date = _fetch_rates_for_date(target_date, request_format)
+		except requests.RequestException as exc:
+			last_error = "{}".format(exc)
+			last_error_kind = "network"
+			continue
+
+		last_response = response
 
 		if response.status_code != 200:
 			last_error = f"{response.status_code} - {response.text}"
+			last_error_kind = "service"
 			continue
 
-		data = response.json()
+		try:
+			data = response.json()
+		except ValueError as exc:
+			last_error = "{}".format(exc)
+			last_error_kind = "service"
+			continue
+
 		if not require_next_day:
 			_save_rate_cache(cache_filename, {
 				"date": target_date_iso,
@@ -312,23 +392,45 @@ def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=
 			return data
 
 		last_error = "No valid next-day rates in response"
+		last_error_kind = "unavailable"
 
 	if require_next_day:
-		_save_rate_cache(cache_filename, {
-			"date": target_date_iso,
-			"requestedDate": target_display,
-			"checked_at": checked_at,
-			"last_checked_hour": last_checked_hour,
-			"attempted_formats": attempted_formats,
-			"available": False,
-			"data": None,
-			"error": last_error,
-		})
+		_save_rate_cache(
+			cache_filename,
+			_rate_fetch_failure_payload(
+				target_date_iso,
+				target_display,
+				checked_at,
+				last_checked_hour,
+				attempted_formats,
+				last_error,
+				last_error_kind or "unavailable",
+				require_next_day=True,
+			),
+		)
 		return None
 
-	if last_response is None:
-		raise RuntimeError("Failed to fetch rates: no response received")
-	raise RuntimeError(f"Failed to fetch rates: {last_response.status_code} - {last_response.text}")
+	if not last_error:
+		if last_response is None:
+			last_error = "no response received"
+			last_error_kind = "network"
+		else:
+			last_error = f"{last_response.status_code} - {last_response.text}"
+			last_error_kind = "service"
+
+	_save_rate_cache(
+		cache_filename,
+		_rate_fetch_failure_payload(
+			target_date_iso,
+			target_display,
+			checked_at,
+			last_checked_hour,
+			attempted_formats,
+			last_error,
+			last_error_kind or "service",
+		),
+	)
+	return None
 
 
 def fetch_or_load_tomorrow_rates(now=None):
@@ -343,12 +445,12 @@ def fetch_or_load_tomorrow_rates(now=None):
 
 def load_cached_tomorrow_rates(now=None):
 	now = now or datetime.now()
-	target_date_iso, _ = _target_day_parts(now.date() + timedelta(days=1))
-	cached = _load_rate_cache(TOMORROW_CACHE_FILENAME)
-	if cached.get("date") != target_date_iso:
-		return None
-	data = cached.get("data")
-	return data if _has_complete_next_day_rates(data, target_date_iso) else None
+	return load_cached_rates(
+		target_date=now.date() + timedelta(days=1),
+		cache_filename=TOMORROW_CACHE_FILENAME,
+		require_next_day=True,
+		now=now,
+	)
 
 
 def apply_price_to_compare_threshold():
@@ -901,8 +1003,8 @@ def render_screen(
 	now=None,
 	start_analysis=True,
 	rate_view="today",
-	today_data=None,
-	tomorrow_data=None,
+	today_data=UNSET,
+	tomorrow_data=UNSET,
 ):
 	output = output or sys.stdout
 	now = now or datetime.now()
@@ -910,11 +1012,18 @@ def render_screen(
 	if clear_screen:
 		print(CLEAR_SCREEN, end="", file=output)
 
-	today_data = today_data if today_data is not None else fetch_or_load_rates(now=now)
-	tomorrow_data = tomorrow_data if tomorrow_data is not None else fetch_or_load_tomorrow_rates(now=now)
+	today_data = fetch_or_load_rates(now=now) if today_data is UNSET else today_data
+	tomorrow_data = fetch_or_load_tomorrow_rates(now=now) if tomorrow_data is UNSET else tomorrow_data
 	ptc_loaded = apply_price_to_compare_threshold()
-	today_hourly_details = today_data.get("hourlyPriceDetails") or []
+	today_hourly_details = (today_data or {}).get("hourlyPriceDetails") or []
 	tomorrow_hourly_details = (tomorrow_data or {}).get("hourlyPriceDetails") or []
+	today_error_kind = _load_rate_cache_entry(now=now).get("error_kind", "")
+	tomorrow_error_kind = _load_rate_cache_entry(
+		target_date=now.date() + timedelta(days=1),
+		cache_filename=TOMORROW_CACHE_FILENAME,
+		require_next_day=True,
+		now=now,
+	).get("error_kind", "")
 	if start_analysis:
 		ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
 	if rate_view == "tomorrow":
@@ -922,10 +1031,13 @@ def render_screen(
 			table = build_table(tomorrow_hourly_details, now=now, bar=bar, highlight_current_hour=False)
 			print(_format_plain_table(table, headers=["Hour", "AM", "PM"]), file=output)
 		else:
-			print("Tomorrow rates are not available yet.", file=output)
+			print(_rate_unavailable_notice("tomorrow", tomorrow_error_kind, require_next_day=True), file=output)
 	else:
-		table = build_table(today_hourly_details, now=now, bar=bar)
-		print(_format_plain_table(table, headers=["Hour", "AM", "PM"]), file=output)
+		if today_hourly_details:
+			table = build_table(today_hourly_details, now=now, bar=bar)
+			print(_format_plain_table(table, headers=["Hour", "AM", "PM"]), file=output)
+		else:
+			print(_rate_unavailable_notice("today", today_error_kind), file=output)
 	if not ptc_loaded:
 		print(f"{RED}PTC FETCH FAILURE{RESET}", file=output)
 	if next_refresh_at is not None:
@@ -996,8 +1108,16 @@ def _analysis_display_text(now=None):
 	thoughts = load_rate_thoughts()
 	date_key, hour_key = _analysis_keys(now)
 	tomorrow_date_key = _tomorrow_analysis_date(now)
+	today_cached = load_cached_rates(now=now)
+	today_error_kind = _load_rate_cache_entry(now=now).get("error_kind", "")
 	tomorrow_daily = thoughts.get("tomorrow_daily_statement") if thoughts.get("tomorrow_date") == tomorrow_date_key else ""
 	tomorrow_cached = load_cached_tomorrow_rates(now=now)
+	tomorrow_error_kind = _load_rate_cache_entry(
+		target_date=now.date() + timedelta(days=1),
+		cache_filename=TOMORROW_CACHE_FILENAME,
+		require_next_day=True,
+		now=now,
+	).get("error_kind", "")
 
 	if not rate_ai_is_configured(config):
 		return (
@@ -1014,11 +1134,15 @@ def _analysis_display_text(now=None):
 	sections = []
 	if hourly:
 		sections.append(f"## Hourly action ({hour_key})\n{hourly}")
+	elif not today_cached:
+		sections.append(f"## Hourly action ({hour_key})\n{_rate_unavailable_text('today', today_error_kind)}")
 	else:
 		sections.append(f"## Hourly action ({hour_key})\nAnalysis is warming up.")
 
 	if daily:
 		sections.append(f"## Daily analysis ({date_key})\n{daily}")
+	elif not today_cached:
+		sections.append(f"## Daily analysis ({date_key})\n{_rate_unavailable_text('today', today_error_kind)}")
 	else:
 		sections.append(f"## Daily analysis ({date_key})\nAnalysis is warming up.")
 
@@ -1027,7 +1151,10 @@ def _analysis_display_text(now=None):
 	elif tomorrow_cached:
 		sections.append(f"## Tomorrow outlook ({tomorrow_date_key})\nAnalysis is warming up.")
 	else:
-		sections.append(f"## Tomorrow outlook ({tomorrow_date_key})\nTomorrow rates are not available yet.")
+		sections.append(
+			f"## Tomorrow outlook ({tomorrow_date_key})\n"
+			f"{_rate_unavailable_text('tomorrow', tomorrow_error_kind, require_next_day=True)}"
+		)
 
 	if status == "running":
 		sections.append("### Status\nGenerating in the background.")
@@ -1152,7 +1279,7 @@ def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analy
 	today_data = fetch_or_load_rates(now=now)
 	tomorrow_data = fetch_or_load_tomorrow_rates(now=now)
 	apply_price_to_compare_threshold()
-	today_hourly_details = today_data.get("hourlyPriceDetails") or []
+	today_hourly_details = (today_data or {}).get("hourlyPriceDetails") or []
 	tomorrow_hourly_details = (tomorrow_data or {}).get("hourlyPriceDetails") or []
 	ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
 	if screen_mode == "analysis":

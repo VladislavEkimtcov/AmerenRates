@@ -5,7 +5,7 @@ import re
 import tempfile
 import unittest
 from contextlib import redirect_stdout
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from unittest import mock
 
@@ -28,6 +28,25 @@ class FakeRatesResponse:
 
     def json(self):
         return {"hourlyPriceDetails": []}
+
+
+class TomorrowRatesResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, selected_date):
+        self.selected_date = selected_date
+
+    def json(self):
+        return {
+            "selectedDate": self.selected_date.strftime("%B %d, %Y"),
+            "isNextDay": True,
+            "hourlyPriceDetails": [
+                {"hour": f"{hour:02d}", "date": f"{self.selected_date.isoformat()}T00:00:00", "price": 0.01 * hour}
+                for hour in range(1, 25)
+            ],
+            "isErrorFetchingData": False,
+        }
 
 
 class ComboFormattingTests(unittest.TestCase):
@@ -56,10 +75,20 @@ class ComboFormattingTests(unittest.TestCase):
         line = combo._bottom_bar_plain_text(
             datetime(2026, 4, 24, 3, 16, 0),
             now=datetime(2026, 4, 24, 3, 15, 18),
-            width=24,
+            width=32,
         )
 
-        self.assertEqual(line, " [i] Analysis       :42 ")
+        self.assertEqual(line, " [i] AI [t] Tomorrow        :42 ")
+
+    def test_bottom_bar_switches_label_on_tomorrow_view(self):
+        line = combo._bottom_bar_plain_text(
+            datetime(2026, 4, 24, 3, 16, 0),
+            now=datetime(2026, 4, 24, 3, 15, 18),
+            width=29,
+            rate_view="tomorrow",
+        )
+
+        self.assertEqual(line, " [i] AI [t] Today        :42 ")
 
     def test_needed_analysis_jobs_detects_daily_and_hourly_misses(self):
         jobs = combo._needed_analysis_jobs({}, now=datetime(2026, 4, 24, 3, 15))
@@ -77,6 +106,23 @@ class ComboFormattingTests(unittest.TestCase):
         jobs = combo._needed_analysis_jobs(thoughts, now=datetime(2026, 4, 24, 3, 0))
 
         self.assertEqual(jobs, [("hourly", "hourly:2026-04-24T03")])
+
+    def test_needed_analysis_jobs_adds_tomorrow_daily_when_rates_are_available(self):
+        tomorrow_details = [{"hour": f"{hour:02d}", "price": 0.01 * hour} for hour in range(1, 25)]
+        thoughts = {
+            "date": "2026-04-24",
+            "daily_statement": "Today summary.",
+            "hour_key": "2026-04-24T03",
+            "hourly_statement": "This hour summary.",
+        }
+
+        jobs = combo._needed_analysis_jobs(
+            thoughts,
+            now=datetime(2026, 4, 24, 3, 0),
+            tomorrow_details=tomorrow_details,
+        )
+
+        self.assertEqual(jobs, [("tomorrow_daily", "tomorrow_daily:2026-04-25")])
 
     def test_build_rate_prompt_includes_context_and_extra_prompt(self):
         config = {"extra_prompt": "Mention EV charging."}
@@ -260,6 +306,48 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertEqual(data, {"hourlyPriceDetails": [{"hour": "00", "price": 0.01}]})
         get_ptc.assert_not_called()
 
+    def test_fetch_or_load_tomorrow_rates_caches_available_next_day_data(self):
+        now = datetime(2026, 5, 27, 9, 15)
+        tomorrow = now.date() + timedelta(days=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "tomorrow_cached.json"
+
+            with (
+                mock.patch.object(combo, "TOMORROW_CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo.requests, "post", return_value=TomorrowRatesResponse(tomorrow)),
+            ):
+                data = combo.fetch_or_load_tomorrow_rates(now=now)
+                cached = json.loads(cache_filename.read_text())
+
+        self.assertTrue(data["isNextDay"])
+        self.assertEqual(len(data["hourlyPriceDetails"]), 24)
+        self.assertTrue(cached["available"])
+        self.assertEqual(cached["date"], tomorrow.isoformat())
+
+    def test_fetch_or_load_tomorrow_rates_retries_only_once_per_hour_when_unavailable(self):
+        now = datetime(2026, 5, 27, 9, 15)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "tomorrow_cached.json"
+            call_count = 0
+
+            def unavailable_response(*args, **kwargs):
+                nonlocal call_count
+                call_count += 1
+                return FakeRatesResponse()
+
+            with (
+                mock.patch.object(combo, "TOMORROW_CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo.requests, "post", side_effect=unavailable_response),
+            ):
+                first = combo.fetch_or_load_tomorrow_rates(now=now)
+                second = combo.fetch_or_load_tomorrow_rates(now=now + timedelta(minutes=10))
+
+        self.assertIsNone(first)
+        self.assertIsNone(second)
+        self.assertEqual(call_count, 1)
+
     def test_main_prints_ptc_failure_after_table(self):
         output = io.StringIO()
 
@@ -288,11 +376,29 @@ class ComboFormattingTests(unittest.TestCase):
                 output=output,
                 now=datetime(2026, 4, 24, 3, 15, 0),
                 next_refresh_at=datetime(2026, 4, 24, 3, 16, 0),
+                rate_view="today",
             )
 
         plain = strip_ansi(output.getvalue())
-        self.assertIn("[i] Analysis", plain)
+        self.assertIn("[i] AI [t] Tomorrow", plain)
         self.assertTrue(plain.endswith(":60 "))
+
+    def test_render_screen_shows_tomorrow_unavailable_message(self):
+        output = io.StringIO()
+
+        with (
+            mock.patch.object(combo, "fetch_or_load_rates", return_value={"hourlyPriceDetails": []}),
+            mock.patch.object(combo, "fetch_or_load_tomorrow_rates", return_value=None),
+            mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=True),
+            mock.patch.object(combo, "ensure_rate_analysis_background"),
+        ):
+            combo.render_screen(
+                output=output,
+                now=datetime(2026, 4, 24, 3, 15, 0),
+                rate_view="tomorrow",
+            )
+
+        self.assertIn("Tomorrow rates are not available yet.", strip_ansi(output.getvalue()))
 
     def test_analysis_display_explains_missing_config(self):
         with mock.patch.object(combo, "load_rate_ai_config", return_value={"enabled": True, "model": ""}):
@@ -323,6 +429,30 @@ class ComboFormattingTests(unittest.TestCase):
 
         self.assertIn("Ready from deepseek-r1:70b at 12.3t/s.", text)
 
+    def test_analysis_display_includes_tomorrow_outlook(self):
+        thoughts = {
+            "date": "2026-04-24",
+            "hour_key": "2026-04-24T03",
+            "analysis_status": "ready",
+            "analysis_error": "",
+            "model": "deepseek-r1:70b",
+            "daily_statement": "Daily summary.",
+            "hourly_statement": "Hourly summary.",
+            "tomorrow_date": "2026-04-25",
+            "tomorrow_daily_statement": "Tomorrow spikes in the evening.",
+            "tomorrow_daily_stats": {"tokens": 22, "tok_per_sec": 4.8, "elapsed": 4.6},
+        }
+
+        with (
+            mock.patch.object(combo, "load_rate_ai_config", return_value={"enabled": True, "model": "deepseek-r1:70b"}),
+            mock.patch.object(combo, "load_rate_thoughts", return_value=thoughts),
+            mock.patch.object(combo, "load_cached_tomorrow_rates", return_value={"hourlyPriceDetails": [1]}),
+        ):
+            text = combo._analysis_display_text(now=datetime(2026, 4, 24, 3, 15))
+
+        self.assertIn("Tomorrow outlook (2026-04-25)", text)
+        self.assertIn("Tomorrow spikes in the evening.", text)
+
     def test_run_rate_analysis_jobs_persists_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
             now = datetime(2026, 4, 24, 3, 15)
@@ -337,7 +467,9 @@ class ComboFormattingTests(unittest.TestCase):
             responses = [
                 ("Daily summary.", {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2}),
                 ("Hourly summary.", {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4}),
+                ("Tomorrow outlook.", {"tokens": 30, "tok_per_sec": 10.0, "elapsed": 3.0}),
             ]
+            tomorrow_details = [{"hour": f"{hour:02d}", "price": 0.02 * hour} for hour in range(1, 25)]
 
             with (
                 mock.patch.object(combo, "BASE_DIR", Path(tmp)),
@@ -348,8 +480,13 @@ class ComboFormattingTests(unittest.TestCase):
                 combo._run_rate_analysis_jobs(
                     [{"hour": "03", "price": 0.042}],
                     now,
-                    [("daily", "daily:2026-04-24"), ("hourly", "hourly:2026-04-24T03")],
+                    [
+                        ("daily", "daily:2026-04-24"),
+                        ("hourly", "hourly:2026-04-24T03"),
+                        ("tomorrow_daily", "tomorrow_daily:2026-04-25"),
+                    ],
                     config,
+                    tomorrow_hourly_details=tomorrow_details,
                 )
                 thoughts = combo.load_rate_thoughts()
 
@@ -358,6 +495,9 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertEqual(thoughts["daily_stats"], {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2})
         self.assertEqual(thoughts["hourly_statement"], "Hourly summary.")
         self.assertEqual(thoughts["hourly_stats"], {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4})
+        self.assertEqual(thoughts["tomorrow_date"], "2026-04-25")
+        self.assertEqual(thoughts["tomorrow_daily_statement"], "Tomorrow outlook.")
+        self.assertEqual(thoughts["tomorrow_daily_stats"], {"tokens": 30, "tok_per_sec": 10.0, "elapsed": 3.0})
 
     def test_analysis_markdown_line_colors_headings_and_bold(self):
         rendered = combo._render_analysis_markdown_line("## **Hourly** action")

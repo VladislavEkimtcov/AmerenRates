@@ -135,7 +135,7 @@ As you can see, "isNextDay": true is the indicator that it's tomorrow's rates we
 
 When the rates for tomorrow are fetched, store them in tomorrow_cached.json. No need to attempt the tomorrow fetch till the cache grows stale, indicative of the date in the tomorrow cache no longer being tomorrow.
 
-When the dates for tomorrow become available, they are run through the PROCESS_RATE_PROMPT.md in "daily" mode. No need for special handling, as the rates info for today and tomorrow is not much different.
+When the rates for tomorrow become available, they are run through the PROCESS_RATE_PROMPT.md in "daily" mode. No need for special handling, as the rates info for today and tomorrow is not much different.
 
 At this point, we might have up to three outstanding prompts for the endpoint. To not overload it, please add a batching system to the LLM analysis, so that prompts are passed to the endpoint only one at a time.
 

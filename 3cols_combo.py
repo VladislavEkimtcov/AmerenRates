@@ -1,5 +1,6 @@
 RATES_URL = "https://www.ameren.com/api/ameren/promotion/RtpHourlyPricesbyDate"
 CACHE_FILENAME = "cached_rates.json"
+TOMORROW_CACHE_FILENAME = "tomorrow_cached.json"
 RATE_THOUGHTS_FILENAME = "rate_thoughts.json"
 RATE_PROMPT_FILENAME = "PROCESS_RATE_PROMPT.md"
 HIGH_PRICE_THRESHOLD = 10
@@ -55,8 +56,10 @@ MOUSE_ENABLE = "\033[?1000h\033[?1006h"
 MOUSE_DISABLE = "\033[?1000l\033[?1006l"
 REFRESH_SECONDS = 60
 BASE_DIR = Path(__file__).resolve().parent
-RATE_ANALYSIS_LOCK = threading.Lock()
+RATE_ANALYSIS_LOCK = threading.RLock()
 RATE_ANALYSIS_IN_FLIGHT = set()
+RATE_ANALYSIS_QUEUE = []
+RATE_ANALYSIS_WORKER = None
 
 
 def _color_for_price(price, thresholds, is_max=False):
@@ -151,42 +154,166 @@ def colorize_price(
 	return f"{prefix}{combined}{RESET}{postfix}"
 
 
-def fetch_or_load_rates():
-	# Use ISO date for cache key, but send "Month DD, YYYY" to the API per new contract
-	today_iso = datetime.now().date().isoformat()
-	today_display = datetime.now().strftime("%B %d, %Y")
+def _cache_path(filename):
+	path = Path(filename)
+	return path if path.is_absolute() else BASE_DIR / path
 
-	# Try to read cache for today's data
-	if os.path.exists(CACHE_FILENAME):
-		with open(CACHE_FILENAME, "r") as f:
-			try:
-				cached = json.load(f)
-				if cached.get("date") == today_iso and cached.get("data"):
-					return cached.get("data")
-			except json.JSONDecodeError:
-				pass
 
-	# Fetch fresh data: try new date format first, then fallback to old format if needed
-	payload_new = {"SelectedDate": today_display}
-	response = requests.post(RATES_URL, json=payload_new)
+def _target_day_parts(target_date):
+	return target_date.isoformat(), target_date.strftime("%B %d, %Y")
 
+
+def _hour_key_for_time(now=None):
+	return (now or datetime.now()).strftime("%Y-%m-%dT%H")
+
+
+def _selected_date_to_iso(value):
+	if not value:
+		return ""
+	try:
+		return datetime.strptime(value, "%B %d, %Y").date().isoformat()
+	except ValueError:
+		return ""
+
+
+def _rate_day_iso(data):
+	if not isinstance(data, dict):
+		return ""
+
+	selected_date = _selected_date_to_iso(data.get("selectedDate"))
+	if selected_date:
+		return selected_date
+
+	hourly_details = data.get("hourlyPriceDetails") or []
+	for item in hourly_details:
+		date_value = item.get("date")
+		if isinstance(date_value, str) and date_value:
+			return date_value.split("T", 1)[0]
+	return ""
+
+
+def _hour_values(hourly_details):
+	hours = set()
+	for item in hourly_details or []:
+		hour_value = str(item.get("hour", "")).strip()
+		if not hour_value:
+			continue
+		if hour_value.isdigit():
+			hours.add(f"{int(hour_value):02d}")
+		else:
+			hours.add(hour_value)
+	return hours
+
+
+def _has_complete_next_day_rates(data, target_date_iso):
+	if not isinstance(data, dict):
+		return False
+	if data.get("isErrorFetchingData"):
+		return False
+	if not data.get("isNextDay"):
+		return False
+
+	hourly_details = data.get("hourlyPriceDetails") or []
+	if len(hourly_details) != 24:
+		return False
+	if _hour_values(hourly_details) != {f"{hour:02d}" for hour in range(1, 25)}:
+		return False
+
+	data_date_iso = _rate_day_iso(data)
+	if data_date_iso and data_date_iso != target_date_iso:
+		return False
+	return True
+
+
+def _load_rate_cache(filename):
+	return _read_json_file(_cache_path(filename), {})
+
+
+def _save_rate_cache(filename, payload):
+	path = _cache_path(filename)
+	with path.open("w", encoding="utf-8") as f:
+		json.dump(payload, f, indent=2, ensure_ascii=False)
+		f.write("\n")
+
+
+def _fetch_rates_for_date(target_date):
+	target_iso, target_display = _target_day_parts(target_date)
+	response = requests.post(RATES_URL, json={"SelectedDate": target_display})
 	if response.status_code != 200:
-		# Fallback to previous ISO format if the new format fails for any reason
-		payload_old = {"SelectedDate": today_iso}
-		response = requests.post(RATES_URL, json=payload_old)
+		response = requests.post(RATES_URL, json={"SelectedDate": target_iso})
+	return response, target_iso, target_display
+
+
+def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=False, now=None):
+	now = now or datetime.now()
+	target_date = target_date or now.date()
+	cache_filename = cache_filename or (TOMORROW_CACHE_FILENAME if require_next_day else CACHE_FILENAME)
+	target_date_iso, target_display = _target_day_parts(target_date)
+	cached = _load_rate_cache(cache_filename)
+
+	if cached.get("date") == target_date_iso:
+		cached_data = cached.get("data")
+		if require_next_day:
+			if _has_complete_next_day_rates(cached_data, target_date_iso):
+				return cached_data
+			if cached.get("last_checked_hour") == _hour_key_for_time(now):
+				return None
+		elif cached_data is not None:
+			return cached_data
+
+	response, _, _ = _fetch_rates_for_date(target_date)
+	checked_at = now.isoformat(timespec="seconds")
+	last_checked_hour = _hour_key_for_time(now)
 
 	if response.status_code == 200:
 		data = response.json()
-		with open(CACHE_FILENAME, "w") as f:
-			json.dump({
-				"date": today_iso,
-				"requestedDate": today_display,
-				"data": data,
-			}, f)
-		get_cached_price_to_compare(today_iso)
+		available = _has_complete_next_day_rates(data, target_date_iso) if require_next_day else True
+		_save_rate_cache(cache_filename, {
+			"date": target_date_iso,
+			"requestedDate": target_display,
+			"checked_at": checked_at,
+			"last_checked_hour": last_checked_hour,
+			"available": available,
+			"data": data if available or not require_next_day else None,
+		})
+		if require_next_day:
+			return data if available else None
+		get_cached_price_to_compare(target_date_iso)
 		return data
 
+	if require_next_day:
+		_save_rate_cache(cache_filename, {
+			"date": target_date_iso,
+			"requestedDate": target_display,
+			"checked_at": checked_at,
+			"last_checked_hour": last_checked_hour,
+			"available": False,
+			"data": None,
+			"error": f"{response.status_code} - {response.text}",
+		})
+		return None
+
 	raise RuntimeError(f"Failed to fetch rates: {response.status_code} - {response.text}")
+
+
+def fetch_or_load_tomorrow_rates(now=None):
+	now = now or datetime.now()
+	return fetch_or_load_rates(
+		target_date=now.date() + timedelta(days=1),
+		cache_filename=TOMORROW_CACHE_FILENAME,
+		require_next_day=True,
+		now=now,
+	)
+
+
+def load_cached_tomorrow_rates(now=None):
+	now = now or datetime.now()
+	target_date_iso, _ = _target_day_parts(now.date() + timedelta(days=1))
+	cached = _load_rate_cache(TOMORROW_CACHE_FILENAME)
+	if cached.get("date") != target_date_iso:
+		return None
+	data = cached.get("data")
+	return data if _has_complete_next_day_rates(data, target_date_iso) else None
 
 
 def apply_price_to_compare_threshold():
@@ -327,19 +454,26 @@ def _read_json_file(path, default):
 
 
 def load_rate_thoughts():
-	return _read_json_file(BASE_DIR / RATE_THOUGHTS_FILENAME, {})
+	with RATE_ANALYSIS_LOCK:
+		return _read_json_file(BASE_DIR / RATE_THOUGHTS_FILENAME, {})
 
 
 def save_rate_thoughts(thoughts):
 	path = BASE_DIR / RATE_THOUGHTS_FILENAME
-	with path.open("w", encoding="utf-8") as f:
-		json.dump(thoughts, f, indent=2, ensure_ascii=False)
-		f.write("\n")
+	with RATE_ANALYSIS_LOCK:
+		with path.open("w", encoding="utf-8") as f:
+			json.dump(thoughts, f, indent=2, ensure_ascii=False)
+			f.write("\n")
 
 
 def _analysis_keys(now=None):
 	now = now or datetime.now()
 	return now.date().isoformat(), now.strftime("%Y-%m-%dT%H")
+
+
+def _tomorrow_analysis_date(now=None):
+	now = now or datetime.now()
+	return (now.date() + timedelta(days=1)).isoformat()
 
 
 def _rate_records(hourly_details):
@@ -396,61 +530,124 @@ def build_rate_prompt(template, analysis_kind, context, config):
 	return template
 
 
-def _needed_analysis_jobs(thoughts, now=None):
+def _needed_analysis_jobs(thoughts, now=None, tomorrow_details=None):
 	date_key, hour_key = _analysis_keys(now)
 	jobs = []
 	if thoughts.get("date") != date_key or not thoughts.get("daily_statement"):
 		jobs.append(("daily", f"daily:{date_key}"))
 	if thoughts.get("hour_key") != hour_key or not thoughts.get("hourly_statement"):
 		jobs.append(("hourly", f"hourly:{hour_key}"))
+	if tomorrow_details:
+		tomorrow_date_key = _tomorrow_analysis_date(now)
+		if thoughts.get("tomorrow_date") != tomorrow_date_key or not thoughts.get("tomorrow_daily_statement"):
+			jobs.append(("tomorrow_daily", f"tomorrow_daily:{tomorrow_date_key}"))
 	return jobs
 
 
-def _clear_stale_analysis_fields(thoughts, date_key, hour_key):
+def _clear_stale_analysis_fields(thoughts, date_key, hour_key, tomorrow_date_key=None):
 	if thoughts.get("date") != date_key:
 		for key in ("daily_statement", "daily_generated_at", "daily_stats"):
 			thoughts.pop(key, None)
 	if thoughts.get("hour_key") != hour_key:
 		for key in ("hourly_statement", "hourly_generated_at", "hourly_stats"):
 			thoughts.pop(key, None)
+	if thoughts.get("tomorrow_date") != tomorrow_date_key:
+		for key in ("tomorrow_date", "tomorrow_daily_statement", "tomorrow_daily_generated_at", "tomorrow_daily_stats"):
+			thoughts.pop(key, None)
 
 
-def ensure_rate_analysis_background(hourly_details, now=None):
+def _start_rate_analysis_worker_locked():
+	global RATE_ANALYSIS_WORKER
+	if RATE_ANALYSIS_WORKER and RATE_ANALYSIS_WORKER.is_alive():
+		return
+	RATE_ANALYSIS_WORKER = threading.Thread(target=_analysis_worker_loop, daemon=True)
+	RATE_ANALYSIS_WORKER.start()
+
+
+def _analysis_worker_loop():
+	global RATE_ANALYSIS_WORKER
+	while True:
+		with RATE_ANALYSIS_LOCK:
+			if not RATE_ANALYSIS_QUEUE:
+				RATE_ANALYSIS_WORKER = None
+				return
+			args = RATE_ANALYSIS_QUEUE.pop(0)
+		_run_rate_analysis_jobs(*args)
+
+
+def ensure_rate_analysis_background(hourly_details, tomorrow_hourly_details=None, now=None):
 	now = now or datetime.now()
 	config = load_rate_ai_config()
-	if not hourly_details or not rate_ai_is_configured(config):
+	tomorrow_hourly_details = tomorrow_hourly_details or []
+	if not (hourly_details or tomorrow_hourly_details) or not rate_ai_is_configured(config):
 		return False
 
 	with RATE_ANALYSIS_LOCK:
 		thoughts = load_rate_thoughts()
 		jobs = [
-			job for job in _needed_analysis_jobs(thoughts, now)
+			job for job in _needed_analysis_jobs(thoughts, now, tomorrow_details=tomorrow_hourly_details)
 			if job[1] not in RATE_ANALYSIS_IN_FLIGHT
 		]
 		if not jobs:
 			return False
 		for _, job_key in jobs:
 			RATE_ANALYSIS_IN_FLIGHT.add(job_key)
-
-	thread = threading.Thread(
-		target=_run_rate_analysis_jobs,
-		args=(list(hourly_details), now, jobs, config),
-		daemon=True,
-	)
-	thread.start()
+		thoughts.update({
+			"analysis_status": "running",
+			"analysis_error": "",
+			"model": config["model"],
+		})
+		save_rate_thoughts(thoughts)
+		RATE_ANALYSIS_QUEUE.append((list(hourly_details), now, jobs, config, list(tomorrow_hourly_details)))
+		_start_rate_analysis_worker_locked()
 	return True
 
 
-def _run_rate_analysis_jobs(hourly_details, now, jobs, config):
+def _job_runtime(analysis_kind, now):
+	if analysis_kind == "tomorrow_daily":
+		tomorrow_date = now.date() + timedelta(days=1)
+		return datetime.combine(tomorrow_date, datetime.min.time())
+	return now
+
+
+def _job_hourly_details(analysis_kind, hourly_details, tomorrow_hourly_details):
+	if analysis_kind == "tomorrow_daily":
+		return tomorrow_hourly_details
+	return hourly_details
+
+
+def _job_prompt_kind(analysis_kind):
+	return "daily" if analysis_kind == "tomorrow_daily" else analysis_kind
+
+
+def _save_analysis_result(thoughts, analysis_kind, statement, stats, now, tomorrow_date_key):
+	generated_at = datetime.now().isoformat(timespec="seconds")
+	if analysis_kind == "daily":
+		thoughts["daily_statement"] = statement
+		thoughts["daily_generated_at"] = generated_at
+		thoughts["daily_stats"] = stats
+	elif analysis_kind == "hourly":
+		thoughts["hourly_statement"] = statement
+		thoughts["hourly_generated_at"] = generated_at
+		thoughts["hourly_stats"] = stats
+	else:
+		thoughts["tomorrow_date"] = tomorrow_date_key
+		thoughts["tomorrow_daily_statement"] = statement
+		thoughts["tomorrow_daily_generated_at"] = generated_at
+		thoughts["tomorrow_daily_stats"] = stats
+
+
+def _run_rate_analysis_jobs(hourly_details, now, jobs, config, tomorrow_hourly_details=None):
+	tomorrow_hourly_details = tomorrow_hourly_details or []
 	date_key, hour_key = _analysis_keys(now)
+	tomorrow_date_key = _tomorrow_analysis_date(now)
 	job_keys = [job_key for _, job_key in jobs]
 
 	try:
 		template = load_rate_prompt_template()
-		context = build_rate_analysis_context(hourly_details, now=now)
 		with RATE_ANALYSIS_LOCK:
 			thoughts = load_rate_thoughts()
-			_clear_stale_analysis_fields(thoughts, date_key, hour_key)
+			_clear_stale_analysis_fields(thoughts, date_key, hour_key, tomorrow_date_key=tomorrow_date_key)
 			thoughts.update({
 				"date": date_key,
 				"hour_key": hour_key,
@@ -461,8 +658,12 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config):
 			save_rate_thoughts(thoughts)
 
 		for analysis_kind, _ in jobs:
+			job_details = _job_hourly_details(analysis_kind, hourly_details, tomorrow_hourly_details)
+			if not job_details:
+				continue
+			context = build_rate_analysis_context(job_details, now=_job_runtime(analysis_kind, now))
 			statement, stats = query_rate_llm(
-				build_rate_prompt(template, analysis_kind, context, config),
+				build_rate_prompt(template, _job_prompt_kind(analysis_kind), context, config),
 				config,
 			)
 			with RATE_ANALYSIS_LOCK:
@@ -471,27 +672,16 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config):
 				thoughts["hour_key"] = hour_key
 				thoughts["model"] = config["model"]
 				thoughts["analysis_status"] = "running"
-				if analysis_kind == "daily":
-					thoughts["daily_statement"] = statement
-					thoughts["daily_generated_at"] = datetime.now().isoformat(timespec="seconds")
-					thoughts["daily_stats"] = stats
-				else:
-					thoughts["hourly_statement"] = statement
-					thoughts["hourly_generated_at"] = datetime.now().isoformat(timespec="seconds")
-					thoughts["hourly_stats"] = stats
+				thoughts["analysis_error"] = ""
+				_save_analysis_result(thoughts, analysis_kind, statement, stats, now, tomorrow_date_key)
 				save_rate_thoughts(thoughts)
-
-		with RATE_ANALYSIS_LOCK:
-			thoughts = load_rate_thoughts()
-			thoughts["analysis_status"] = "ready"
-			thoughts["analysis_error"] = ""
-			save_rate_thoughts(thoughts)
 	except Exception as exc:
 		with RATE_ANALYSIS_LOCK:
 			thoughts = load_rate_thoughts()
 			thoughts.update({
 				"date": date_key,
 				"hour_key": hour_key,
+				"model": config["model"],
 				"analysis_status": "error",
 				"analysis_error": str(exc),
 			})
@@ -500,6 +690,11 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config):
 		with RATE_ANALYSIS_LOCK:
 			for job_key in job_keys:
 				RATE_ANALYSIS_IN_FLIGHT.discard(job_key)
+			thoughts = load_rate_thoughts()
+			if not RATE_ANALYSIS_IN_FLIGHT and thoughts.get("analysis_status") != "error":
+				thoughts["analysis_status"] = "ready"
+				thoughts["analysis_error"] = ""
+				save_rate_thoughts(thoughts)
 
 
 def _visible_width(value):
@@ -529,7 +724,7 @@ def _format_plain_table(rows, headers):
 	return "\n".join(formatted)
 
 
-def build_table(hourly_details, now=None, bar=DEFAULT_bar):
+def build_table(hourly_details, now=None, bar=DEFAULT_bar, highlight_current_hour=True):
 	if bar <= 0:
 		raise ValueError("bar must be greater than 0")
 
@@ -556,8 +751,8 @@ def build_table(hourly_details, now=None, bar=DEFAULT_bar):
 		time_label = hour_to_time(item["hour"], hour_offset)
 		normalized_hour = normalize_hour(item["hour"], hour_offset)
 
-		highlight_price = normalized_hour == current_hour
-		if highlight_price or (normalized_hour + 12) % 24 == current_hour:
+		highlight_price = highlight_current_hour and normalized_hour == current_hour
+		if highlight_current_hour and (highlight_price or (normalized_hour + 12) % 24 == current_hour):
 			time_label = current_time_marker
 
 		price = round(item["price"] * 100, 1)
@@ -610,18 +805,24 @@ def _terminal_size():
 	return size.columns, size.lines
 
 
-def _bottom_bar_plain_text(next_refresh_at, now=None, width=None):
+def _bottom_bar_plain_text(next_refresh_at, now=None, width=None, rate_view="today"):
 	now = now or datetime.now()
 	remaining = (next_refresh_at - now).total_seconds()
 	width = width or _terminal_size()[0]
-	left = " [i] Analysis "
+	toggle_target = "Tomorrow" if rate_view == "today" else "Today"
+	left = f" [i] AI [t] {toggle_target} "
 	right = f" {_format_refresh_seconds(remaining)} "
-	padding = max(1, width - len(left) - len(right))
-	return (left + (" " * padding) + right)[:width]
+	if width <= len(right):
+		return right[-width:]
+	available_left = max(0, width - len(right))
+	if len(left) >= available_left:
+		return f"{left[:available_left]}{right}"[:width]
+	padding = width - len(left) - len(right)
+	return f"{left}{' ' * padding}{right}"
 
 
-def _bottom_bar_line(next_refresh_at, now=None, width=None):
-	return f"{BG_BLUE}{WHITE}{_bottom_bar_plain_text(next_refresh_at, now=now, width=width)}{RESET}"
+def _bottom_bar_line(next_refresh_at, now=None, width=None, rate_view="today"):
+	return f"{BG_BLUE}{WHITE}{_bottom_bar_plain_text(next_refresh_at, now=now, width=width, rate_view=rate_view)}{RESET}"
 
 
 def _analysis_bottom_bar_plain_text(next_refresh_at, now=None, width=None):
@@ -630,18 +831,23 @@ def _analysis_bottom_bar_plain_text(next_refresh_at, now=None, width=None):
 	width = width or _terminal_size()[0]
 	left = " [i] Rates  ↑↓ Scroll "
 	right = f" {_format_refresh_seconds(remaining)} "
-	padding = max(1, width - _visible_width(left) - len(right))
-	return (left + (" " * padding) + right)[:width]
+	if width <= len(right):
+		return right[-width:]
+	available_left = max(0, width - len(right))
+	if _visible_width(left) >= available_left:
+		return f"{left[:available_left]}{right}"[:width]
+	padding = width - _visible_width(left) - len(right)
+	return f"{left}{' ' * padding}{right}"
 
 
 def _analysis_bottom_bar_line(next_refresh_at, now=None, width=None):
 	return f"{BG_BLUE}{WHITE}{_analysis_bottom_bar_plain_text(next_refresh_at, now=now, width=width)}{RESET}"
 
 
-def _write_bottom_bar(next_refresh_at, output=None, now=None):
+def _write_bottom_bar(next_refresh_at, output=None, now=None, rate_view="today"):
 	output = output or sys.stdout
 	width, height = _terminal_size()
-	output.write(f"\033[{height};1H\r{CLEAR_LINE}{_bottom_bar_line(next_refresh_at, now=now, width=width)}")
+	output.write(f"\033[{height};1H\r{CLEAR_LINE}{_bottom_bar_line(next_refresh_at, now=now, width=width, rate_view=rate_view)}")
 	output.flush()
 
 
@@ -659,6 +865,9 @@ def render_screen(
 	next_refresh_at=None,
 	now=None,
 	start_analysis=True,
+	rate_view="today",
+	today_data=None,
+	tomorrow_data=None,
 ):
 	output = output or sys.stdout
 	now = now or datetime.now()
@@ -666,22 +875,31 @@ def render_screen(
 	if clear_screen:
 		print(CLEAR_SCREEN, end="", file=output)
 
-	data = fetch_or_load_rates()
+	today_data = today_data if today_data is not None else fetch_or_load_rates(now=now)
+	tomorrow_data = tomorrow_data if tomorrow_data is not None else fetch_or_load_tomorrow_rates(now=now)
 	ptc_loaded = apply_price_to_compare_threshold()
-	hourly_details = data.get("hourlyPriceDetails") or []
-	table = build_table(hourly_details, now=now, bar=bar)
+	today_hourly_details = today_data.get("hourlyPriceDetails") or []
+	tomorrow_hourly_details = (tomorrow_data or {}).get("hourlyPriceDetails") or []
 	if start_analysis:
-		ensure_rate_analysis_background(hourly_details, now=now)
-	print(_format_plain_table(table, headers=["Hour", "AM", "PM"]), file=output)
+		ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
+	if rate_view == "tomorrow":
+		if tomorrow_hourly_details:
+			table = build_table(tomorrow_hourly_details, now=now, bar=bar, highlight_current_hour=False)
+			print(_format_plain_table(table, headers=["Hour", "AM", "PM"]), file=output)
+		else:
+			print("Tomorrow rates are not available yet.", file=output)
+	else:
+		table = build_table(today_hourly_details, now=now, bar=bar)
+		print(_format_plain_table(table, headers=["Hour", "AM", "PM"]), file=output)
 	if not ptc_loaded:
 		print(f"{RED}PTC FETCH FAILURE{RESET}", file=output)
 	if next_refresh_at is not None:
-		_write_bottom_bar(next_refresh_at, output=output, now=now)
+		_write_bottom_bar(next_refresh_at, output=output, now=now, rate_view=rate_view)
 	output.flush()
 
 
-def _update_countdown_line(next_refresh_at, output=None):
-	_write_bottom_bar(next_refresh_at, output=output)
+def _update_countdown_line(next_refresh_at, output=None, rate_view="today"):
+	_write_bottom_bar(next_refresh_at, output=output, rate_view=rate_view)
 
 
 def _update_analysis_countdown_line(next_refresh_at, output=None):
@@ -742,6 +960,9 @@ def _analysis_display_text(now=None):
 	config = load_rate_ai_config()
 	thoughts = load_rate_thoughts()
 	date_key, hour_key = _analysis_keys(now)
+	tomorrow_date_key = _tomorrow_analysis_date(now)
+	tomorrow_daily = thoughts.get("tomorrow_daily_statement") if thoughts.get("tomorrow_date") == tomorrow_date_key else ""
+	tomorrow_cached = load_cached_tomorrow_rates(now=now)
 
 	if not rate_ai_is_configured(config):
 		return (
@@ -766,6 +987,13 @@ def _analysis_display_text(now=None):
 	else:
 		sections.append(f"## Daily analysis ({date_key})\nAnalysis is warming up.")
 
+	if tomorrow_daily:
+		sections.append(f"## Tomorrow outlook ({tomorrow_date_key})\n{tomorrow_daily}")
+	elif tomorrow_cached:
+		sections.append(f"## Tomorrow outlook ({tomorrow_date_key})\nAnalysis is warming up.")
+	else:
+		sections.append(f"## Tomorrow outlook ({tomorrow_date_key})\nTomorrow rates are not available yet.")
+
 	if status == "running":
 		sections.append("### Status\nGenerating in the background.")
 	elif status == "error" and error:
@@ -776,6 +1004,8 @@ def _analysis_display_text(now=None):
 			stats_candidates.append((thoughts.get("daily_generated_at", ""), thoughts["daily_stats"]))
 		if thoughts.get("hour_key") == hour_key and isinstance(thoughts.get("hourly_stats"), dict):
 			stats_candidates.append((thoughts.get("hourly_generated_at", ""), thoughts["hourly_stats"]))
+		if thoughts.get("tomorrow_date") == tomorrow_date_key and isinstance(thoughts.get("tomorrow_daily_stats"), dict):
+			stats_candidates.append((thoughts.get("tomorrow_daily_generated_at", ""), thoughts["tomorrow_daily_stats"]))
 		latest_stats = max(stats_candidates, default=("", {}))[1]
 		tok_per_sec = latest_stats.get("tok_per_sec") if isinstance(latest_stats, dict) else 0
 		if tok_per_sec:
@@ -882,16 +1112,20 @@ def terminal_key_reader(input_stream=None):
 		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def _refresh_screen(view_mode, args, output, next_refresh_at, analysis_scroll=0):
-	if view_mode == "analysis":
-		data = fetch_or_load_rates()
-		apply_price_to_compare_threshold()
-		hourly_details = data.get("hourlyPriceDetails") or []
-		ensure_rate_analysis_background(hourly_details)
+def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analysis_scroll=0):
+	now = datetime.now()
+	today_data = fetch_or_load_rates(now=now)
+	tomorrow_data = fetch_or_load_tomorrow_rates(now=now)
+	apply_price_to_compare_threshold()
+	today_hourly_details = today_data.get("hourlyPriceDetails") or []
+	tomorrow_hourly_details = (tomorrow_data or {}).get("hourlyPriceDetails") or []
+	ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
+	if screen_mode == "analysis":
 		return render_analysis_screen(
 			output=output,
 			clear_screen=True,
 			next_refresh_at=next_refresh_at,
+			now=now,
 			scroll=analysis_scroll,
 		)
 	render_screen(
@@ -899,6 +1133,11 @@ def _refresh_screen(view_mode, args, output, next_refresh_at, analysis_scroll=0)
 		output=output,
 		clear_screen=True,
 		next_refresh_at=next_refresh_at,
+		now=now,
+		start_analysis=False,
+		rate_view=rate_view,
+		today_data=today_data,
+		tomorrow_data=tomorrow_data,
 	)
 	return 0
 
@@ -906,7 +1145,8 @@ def _refresh_screen(view_mode, args, output, next_refresh_at, analysis_scroll=0)
 def run_refresh_loop(args, output=None):
 	output = output or sys.stdout
 	next_delay = seconds_until_next_minute()
-	view_mode = "rates"
+	screen_mode = "rates"
+	rate_view = "today"
 	analysis_scroll = 0
 	analysis_max_scroll = 0
 
@@ -920,30 +1160,42 @@ def run_refresh_loop(args, output=None):
 
 			try:
 				analysis_max_scroll = _refresh_screen(
-					view_mode,
+					screen_mode,
+					rate_view,
 					args,
 					output,
 					next_refresh_at,
 					analysis_scroll=analysis_scroll,
 				)
 				while not refresh_ready.is_set():
-					if view_mode == "analysis":
+					if screen_mode == "analysis":
 						_update_analysis_countdown_line(next_refresh_at, output=output)
 					else:
-						_update_countdown_line(next_refresh_at, output=output)
+						_update_countdown_line(next_refresh_at, output=output, rate_view=rate_view)
 					key = read_key(timeout=1)
 					if key in {"i", "I"}:
-						view_mode = "analysis" if view_mode == "rates" else "rates"
-						if view_mode == "analysis":
+						screen_mode = "analysis" if screen_mode == "rates" else "rates"
+						if screen_mode == "analysis":
 							analysis_scroll = 0
 						analysis_max_scroll = _refresh_screen(
-							view_mode,
+							screen_mode,
+							rate_view,
 							args,
 							output,
 							next_refresh_at,
 							analysis_scroll=analysis_scroll,
 						)
-					elif view_mode == "analysis" and key in {KEY_UP, KEY_MOUSE_UP}:
+					elif screen_mode == "rates" and key in {"t", "T"}:
+						rate_view = "tomorrow" if rate_view == "today" else "today"
+						analysis_max_scroll = _refresh_screen(
+							screen_mode,
+							rate_view,
+							args,
+							output,
+							next_refresh_at,
+							analysis_scroll=analysis_scroll,
+						)
+					elif screen_mode == "analysis" and key in {KEY_UP, KEY_MOUSE_UP}:
 						step = 3 if key == KEY_MOUSE_UP else 1
 						analysis_scroll = max(0, analysis_scroll - step)
 						analysis_max_scroll = render_analysis_screen(
@@ -952,7 +1204,7 @@ def run_refresh_loop(args, output=None):
 							next_refresh_at=next_refresh_at,
 							scroll=analysis_scroll,
 						)
-					elif view_mode == "analysis" and key in {KEY_DOWN, KEY_MOUSE_DOWN}:
+					elif screen_mode == "analysis" and key in {KEY_DOWN, KEY_MOUSE_DOWN}:
 						step = 3 if key == KEY_MOUSE_DOWN else 1
 						analysis_scroll = min(analysis_max_scroll, analysis_scroll + step)
 						analysis_max_scroll = render_analysis_screen(
@@ -961,7 +1213,7 @@ def run_refresh_loop(args, output=None):
 							next_refresh_at=next_refresh_at,
 							scroll=analysis_scroll,
 						)
-					elif view_mode == "analysis" and key == KEY_PAGE_UP:
+					elif screen_mode == "analysis" and key == KEY_PAGE_UP:
 						_, height = _terminal_size()
 						analysis_scroll = max(0, analysis_scroll - max(1, height - 3))
 						analysis_max_scroll = render_analysis_screen(
@@ -970,7 +1222,7 @@ def run_refresh_loop(args, output=None):
 							next_refresh_at=next_refresh_at,
 							scroll=analysis_scroll,
 						)
-					elif view_mode == "analysis" and key == KEY_PAGE_DOWN:
+					elif screen_mode == "analysis" and key == KEY_PAGE_DOWN:
 						_, height = _terminal_size()
 						analysis_scroll = min(analysis_max_scroll, analysis_scroll + max(1, height - 3))
 						analysis_max_scroll = render_analysis_screen(
@@ -981,10 +1233,10 @@ def run_refresh_loop(args, output=None):
 						)
 					elif key in {"q", "Q"}:
 						return
-				if view_mode == "analysis":
+				if screen_mode == "analysis":
 					_update_analysis_countdown_line(next_refresh_at, output=output)
 				else:
-					_update_countdown_line(next_refresh_at, output=output)
+					_update_countdown_line(next_refresh_at, output=output, rate_view=rate_view)
 			finally:
 				timer.cancel()
 

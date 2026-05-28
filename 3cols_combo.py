@@ -844,7 +844,7 @@ def _bottom_bar_plain_text(next_refresh_at, now=None, width=None, rate_view="tod
 	now = now or datetime.now()
 	remaining = (next_refresh_at - now).total_seconds()
 	width = width or _terminal_size()[0]
-	toggle_target = "Tomorrow" if rate_view == "today" else "Today"
+	toggle_target = "Later" if rate_view == "today" else "Today"
 	left = f" [i] AI [t] {toggle_target} "
 	right = f" {_format_refresh_seconds(remaining)} "
 	if width <= len(right):

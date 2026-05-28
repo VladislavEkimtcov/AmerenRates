@@ -142,4 +142,4 @@ At this point, we might have up to three outstanding prompts for the endpoint. T
 Let's talk about the UX part of this. Right now, the only two screens are today's rates and analysis. Change the following:
 1. On today's rates screen, it is now possible to press the "t" button to view the graph for tomorrow.
 2. The bottom bar now reads "[i] AI [t] Later" on the today graph and "[i] AI [t] Today" on the tomorrow graph. The backwards seconds stay where they are.
-3. The new "Tomorrow outlook" section is now made available on the reports page.
+3. The new "Later outlook" section is now made available on the reports page.

@@ -163,6 +163,14 @@ def _target_day_parts(target_date):
 	return target_date.isoformat(), target_date.strftime("%B %d, %Y")
 
 
+def _selected_date_payloads(target_date):
+	target_iso, target_display = _target_day_parts(target_date)
+	return [
+		("display", target_display),
+		("iso", target_iso),
+	]
+
+
 def _hour_key_for_time(now=None):
 	return (now or datetime.now()).strftime("%Y-%m-%dT%H")
 
@@ -236,12 +244,11 @@ def _save_rate_cache(filename, payload):
 		f.write("\n")
 
 
-def _fetch_rates_for_date(target_date):
-	target_iso, target_display = _target_day_parts(target_date)
-	response = requests.post(RATES_URL, json={"SelectedDate": target_display})
-	if response.status_code != 200:
-		response = requests.post(RATES_URL, json={"SelectedDate": target_iso})
-	return response, target_iso, target_display
+def _fetch_rates_for_date(target_date, request_format):
+	payloads = dict(_selected_date_payloads(target_date))
+	selected_date = payloads[request_format]
+	response = requests.post(RATES_URL, json={"SelectedDate": selected_date})
+	return response, selected_date
 
 
 def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=False, now=None):
@@ -250,36 +257,61 @@ def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=
 	cache_filename = cache_filename or (TOMORROW_CACHE_FILENAME if require_next_day else CACHE_FILENAME)
 	target_date_iso, target_display = _target_day_parts(target_date)
 	cached = _load_rate_cache(cache_filename)
+	attempted_formats = list(cached.get("attempted_formats") or [])
 
 	if cached.get("date") == target_date_iso:
 		cached_data = cached.get("data")
 		if require_next_day:
 			if _has_complete_next_day_rates(cached_data, target_date_iso):
 				return cached_data
-			if cached.get("last_checked_hour") == _hour_key_for_time(now):
+			if cached.get("last_checked_hour") == _hour_key_for_time(now) and "iso" in attempted_formats:
 				return None
 		elif cached_data is not None:
 			return cached_data
 
-	response, _, _ = _fetch_rates_for_date(target_date)
 	checked_at = now.isoformat(timespec="seconds")
 	last_checked_hour = _hour_key_for_time(now)
+	attempted_formats = []
+	last_response = None
+	last_error = ""
 
-	if response.status_code == 200:
+	for request_format, _ in _selected_date_payloads(target_date):
+		response, requested_date = _fetch_rates_for_date(target_date, request_format)
+		last_response = response
+		attempted_formats.append(request_format)
+
+		if response.status_code != 200:
+			last_error = f"{response.status_code} - {response.text}"
+			continue
+
 		data = response.json()
-		available = _has_complete_next_day_rates(data, target_date_iso) if require_next_day else True
-		_save_rate_cache(cache_filename, {
-			"date": target_date_iso,
-			"requestedDate": target_display,
-			"checked_at": checked_at,
-			"last_checked_hour": last_checked_hour,
-			"available": available,
-			"data": data if available or not require_next_day else None,
-		})
-		if require_next_day:
-			return data if available else None
-		get_cached_price_to_compare(target_date_iso)
-		return data
+		if not require_next_day:
+			_save_rate_cache(cache_filename, {
+				"date": target_date_iso,
+				"requestedDate": target_display,
+				"checked_at": checked_at,
+				"last_checked_hour": last_checked_hour,
+				"attempted_formats": attempted_formats,
+				"data": data,
+			})
+			get_cached_price_to_compare(target_date_iso)
+			return data
+
+		if _has_complete_next_day_rates(data, target_date_iso):
+			_save_rate_cache(cache_filename, {
+				"date": target_date_iso,
+				"requestedDate": target_display,
+				"checked_at": checked_at,
+				"last_checked_hour": last_checked_hour,
+				"attempted_formats": attempted_formats,
+				"successful_format": request_format,
+				"selectedDateSent": requested_date,
+				"available": True,
+				"data": data,
+			})
+			return data
+
+		last_error = "No valid next-day rates in response"
 
 	if require_next_day:
 		_save_rate_cache(cache_filename, {
@@ -287,13 +319,16 @@ def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=
 			"requestedDate": target_display,
 			"checked_at": checked_at,
 			"last_checked_hour": last_checked_hour,
+			"attempted_formats": attempted_formats,
 			"available": False,
 			"data": None,
-			"error": f"{response.status_code} - {response.text}",
+			"error": last_error,
 		})
 		return None
 
-	raise RuntimeError(f"Failed to fetch rates: {response.status_code} - {response.text}")
+	if last_response is None:
+		raise RuntimeError("Failed to fetch rates: no response received")
+	raise RuntimeError(f"Failed to fetch rates: {last_response.status_code} - {last_response.text}")
 
 
 def fetch_or_load_tomorrow_rates(now=None):

@@ -49,6 +49,17 @@ class TomorrowRatesResponse:
         }
 
 
+class JsonRatesResponse:
+    status_code = 200
+    text = ""
+
+    def __init__(self, payload):
+        self.payload = payload
+
+    def json(self):
+        return self.payload
+
+
 class ComboFormattingTests(unittest.TestCase):
     def tearDown(self):
         combo.HIGH_PRICE_THRESHOLD = 10
@@ -78,7 +89,7 @@ class ComboFormattingTests(unittest.TestCase):
             width=32,
         )
 
-        self.assertEqual(line, " [i] AI [t] Tomorrow        :42 ")
+        self.assertEqual(line, " [i] AI [t] Later        :42 ")
 
     def test_bottom_bar_switches_label_on_tomorrow_view(self):
         line = combo._bottom_bar_plain_text(
@@ -325,6 +336,42 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertTrue(cached["available"])
         self.assertEqual(cached["date"], tomorrow.isoformat())
 
+    def test_fetch_or_load_tomorrow_rates_retries_iso_after_display_format_false_negative(self):
+        now = datetime(2026, 5, 27, 9, 15)
+        tomorrow = now.date() + timedelta(days=1)
+        requests_seen = []
+
+        display_false_negative = JsonRatesResponse({
+            "selectedDate": tomorrow.strftime("%B %d, %Y"),
+            "isNextDay": False,
+            "hourlyPriceDetails": [],
+            "isErrorFetchingData": False,
+        })
+        iso_success = TomorrowRatesResponse(tomorrow)
+
+        def post_side_effect(url, json):
+            requests_seen.append(json["SelectedDate"])
+            if json["SelectedDate"] == tomorrow.strftime("%B %d, %Y"):
+                return display_false_negative
+            if json["SelectedDate"] == tomorrow.isoformat():
+                return iso_success
+            raise AssertionError(f"Unexpected SelectedDate payload: {json['SelectedDate']}")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "tomorrow_cached.json"
+
+            with (
+                mock.patch.object(combo, "TOMORROW_CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo.requests, "post", side_effect=post_side_effect),
+            ):
+                data = combo.fetch_or_load_tomorrow_rates(now=now)
+                cached = json.loads(cache_filename.read_text())
+
+        self.assertEqual(requests_seen, [tomorrow.strftime("%B %d, %Y"), tomorrow.isoformat()])
+        self.assertTrue(data["isNextDay"])
+        self.assertEqual(cached["successful_format"], "iso")
+        self.assertEqual(cached["selectedDateSent"], tomorrow.isoformat())
+
     def test_fetch_or_load_tomorrow_rates_retries_only_once_per_hour_when_unavailable(self):
         now = datetime(2026, 5, 27, 9, 15)
 
@@ -346,7 +393,28 @@ class ComboFormattingTests(unittest.TestCase):
 
         self.assertIsNone(first)
         self.assertIsNone(second)
-        self.assertEqual(call_count, 1)
+        self.assertEqual(call_count, 2)
+
+    def test_fetch_or_load_tomorrow_rates_retries_same_hour_for_old_cache_without_iso_attempt(self):
+        now = datetime(2026, 5, 27, 9, 15)
+        tomorrow = now.date() + timedelta(days=1)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            cache_filename = Path(tmp) / "tomorrow_cached.json"
+            cache_filename.write_text(json.dumps({
+                "date": tomorrow.isoformat(),
+                "last_checked_hour": now.strftime("%Y-%m-%dT%H"),
+                "available": False,
+                "data": None,
+            }))
+
+            with (
+                mock.patch.object(combo, "TOMORROW_CACHE_FILENAME", str(cache_filename)),
+                mock.patch.object(combo.requests, "post", side_effect=[FakeRatesResponse(), TomorrowRatesResponse(tomorrow)]),
+            ):
+                data = combo.fetch_or_load_tomorrow_rates(now=now)
+
+        self.assertTrue(data["isNextDay"])
 
     def test_main_prints_ptc_failure_after_table(self):
         output = io.StringIO()
@@ -380,7 +448,7 @@ class ComboFormattingTests(unittest.TestCase):
             )
 
         plain = strip_ansi(output.getvalue())
-        self.assertIn("[i] AI [t] Tomorrow", plain)
+        self.assertIn("[i] AI [t] Later", plain)
         self.assertTrue(plain.endswith(":60 "))
 
     def test_render_screen_shows_tomorrow_unavailable_message(self):
@@ -399,6 +467,28 @@ class ComboFormattingTests(unittest.TestCase):
             )
 
         self.assertIn("Tomorrow rates are not available yet.", strip_ansi(output.getvalue()))
+
+    def test_render_screen_uses_iso_fallback_tomorrow_data(self):
+        output = io.StringIO()
+        now = datetime(2026, 5, 27, 9, 15)
+        tomorrow = now.date() + timedelta(days=1)
+
+        with (
+            mock.patch.object(combo, "fetch_or_load_rates", return_value={"hourlyPriceDetails": []}),
+            mock.patch.object(combo, "fetch_or_load_tomorrow_rates", return_value=TomorrowRatesResponse(tomorrow).json()),
+            mock.patch.object(combo, "apply_price_to_compare_threshold", return_value=True),
+            mock.patch.object(combo, "build_table", return_value=[["12:00", "¢1.0", "¢2.0"]]),
+            mock.patch.object(combo, "ensure_rate_analysis_background"),
+        ):
+            combo.render_screen(
+                output=output,
+                now=now,
+                rate_view="tomorrow",
+            )
+
+        plain = strip_ansi(output.getvalue())
+        self.assertIn("Hour  AM   PM", plain)
+        self.assertNotIn("Tomorrow rates are not available yet.", plain)
 
     def test_analysis_display_explains_missing_config(self):
         with mock.patch.object(combo, "load_rate_ai_config", return_value={"enabled": True, "model": ""}):

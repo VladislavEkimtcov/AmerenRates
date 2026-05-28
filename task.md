@@ -133,13 +133,13 @@ Every hour, check if tomorrow's rates are available by filing a request to the s
 
 As you can see, "isNextDay": true is the indicator that it's tomorrow's rates we are looking at, and all hours are present.
 
-When the rates for tomorrow are fetched, store them in tomorrow_cached.json. No need to attempt the tomorrow fetch till the cached grows stale, indicative of the date in the tomorrow cache no longer being tomorrow.
+When the rates for tomorrow are fetched, store them in tomorrow_cached.json. No need to attempt the tomorrow fetch till the cache grows stale, indicative of the date in the tomorrow cache no longer being tomorrow.
 
 When the dates for tomorrow become available, they are run through the PROCESS_RATE_PROMPT.md in "daily" mode. No need for special handling, as the rates info for today and tomorrow is not much different.
 
-At this point, we might have up to three outstanding prompts for the endpoint. To not overload it, please add a batching system to the LLM analysis, so that prompts are passed to the endpoint  only one at a time.
+At this point, we might have up to three outstanding prompts for the endpoint. To not overload it, please add a batching system to the LLM analysis, so that prompts are passed to the endpoint only one at a time.
 
-Let's talk the UX part of this. Right now, the only two screen are today's rates and analysis. Change the following:
-1. In the today's rates screen, it is now possible to press the "t" button to view the graph for tomorrow
-2. the bottom bar now reads "[i] AI [t] Tomorrow" on the today graph and "[i] AI [t] Today" on the tomorrow graph. The backwards seconds stay where they are
-3. the new "Tomorrow outlook" section is now made available on the reports page
+Let's talk about the UX part of this. Right now, the only two screens are today's rates and analysis. Change the following:
+1. On today's rates screen, it is now possible to press the "t" button to view the graph for tomorrow.
+2. The bottom bar now reads "[i] AI [t] Tomorrow" on the today graph and "[i] AI [t] Today" on the tomorrow graph. The backwards seconds stay where they are.
+3. The new "Tomorrow outlook" section is now made available on the reports page.

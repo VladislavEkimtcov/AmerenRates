@@ -15,3 +15,5 @@ python 3cols_combo.py
 
 The app refreshes itself every minute. Press `i` to toggle the cached analysis
 view. Daily and hourly results are stored in `rate_thoughts.json`.
+
+Pass `--noai` to disable AI analysis and hide AI controls entirely.

@@ -942,12 +942,12 @@ def _terminal_size():
 	return size.columns, size.lines
 
 
-def _bottom_bar_plain_text(next_refresh_at, now=None, width=None, rate_view="today"):
+def _bottom_bar_plain_text(next_refresh_at, now=None, width=None, rate_view="today", ai_enabled=True):
 	now = now or datetime.now()
 	remaining = (next_refresh_at - now).total_seconds()
 	width = width or _terminal_size()[0]
 	toggle_target = "Later" if rate_view == "today" else "Today"
-	left = f" [i] AI [t] {toggle_target} "
+	left = f" [i] AI [t] {toggle_target} " if ai_enabled else f" [t] {toggle_target} "
 	right = f" {_format_refresh_seconds(remaining)} "
 	if width <= len(right):
 		return right[-width:]
@@ -958,8 +958,8 @@ def _bottom_bar_plain_text(next_refresh_at, now=None, width=None, rate_view="tod
 	return f"{left}{' ' * padding}{right}"
 
 
-def _bottom_bar_line(next_refresh_at, now=None, width=None, rate_view="today"):
-	return f"{BG_BLUE}{WHITE}{_bottom_bar_plain_text(next_refresh_at, now=now, width=width, rate_view=rate_view)}{RESET}"
+def _bottom_bar_line(next_refresh_at, now=None, width=None, rate_view="today", ai_enabled=True):
+	return f"{BG_BLUE}{WHITE}{_bottom_bar_plain_text(next_refresh_at, now=now, width=width, rate_view=rate_view, ai_enabled=ai_enabled)}{RESET}"
 
 
 def _analysis_bottom_bar_plain_text(next_refresh_at, now=None, width=None):
@@ -981,10 +981,10 @@ def _analysis_bottom_bar_line(next_refresh_at, now=None, width=None):
 	return f"{BG_BLUE}{WHITE}{_analysis_bottom_bar_plain_text(next_refresh_at, now=now, width=width)}{RESET}"
 
 
-def _write_bottom_bar(next_refresh_at, output=None, now=None, rate_view="today"):
+def _write_bottom_bar(next_refresh_at, output=None, now=None, rate_view="today", ai_enabled=True):
 	output = output or sys.stdout
 	width, height = _terminal_size()
-	output.write(f"\033[{height};1H\r{CLEAR_LINE}{_bottom_bar_line(next_refresh_at, now=now, width=width, rate_view=rate_view)}")
+	output.write(f"\033[{height};1H\r{CLEAR_LINE}{_bottom_bar_line(next_refresh_at, now=now, width=width, rate_view=rate_view, ai_enabled=ai_enabled)}")
 	output.flush()
 
 
@@ -1003,6 +1003,7 @@ def render_screen(
 	now=None,
 	start_analysis=True,
 	rate_view="today",
+	ai_enabled=True,
 	today_data=UNSET,
 	tomorrow_data=UNSET,
 ):
@@ -1024,7 +1025,7 @@ def render_screen(
 		require_next_day=True,
 		now=now,
 	).get("error_kind", "")
-	if start_analysis:
+	if ai_enabled and start_analysis:
 		ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
 	if rate_view == "tomorrow":
 		if tomorrow_hourly_details:
@@ -1041,12 +1042,12 @@ def render_screen(
 	if not ptc_loaded:
 		print(f"{RED}PTC FETCH FAILURE{RESET}", file=output)
 	if next_refresh_at is not None:
-		_write_bottom_bar(next_refresh_at, output=output, now=now, rate_view=rate_view)
+		_write_bottom_bar(next_refresh_at, output=output, now=now, rate_view=rate_view, ai_enabled=ai_enabled)
 	output.flush()
 
 
-def _update_countdown_line(next_refresh_at, output=None, rate_view="today"):
-	_write_bottom_bar(next_refresh_at, output=output, rate_view=rate_view)
+def _update_countdown_line(next_refresh_at, output=None, rate_view="today", ai_enabled=True):
+	_write_bottom_bar(next_refresh_at, output=output, rate_view=rate_view, ai_enabled=ai_enabled)
 
 
 def _update_analysis_countdown_line(next_refresh_at, output=None):
@@ -1275,14 +1276,16 @@ def terminal_key_reader(input_stream=None):
 
 
 def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analysis_scroll=0):
+	ai_enabled = not getattr(args, "noai", False)
 	now = datetime.now()
 	today_data = fetch_or_load_rates(now=now)
 	tomorrow_data = fetch_or_load_tomorrow_rates(now=now)
 	apply_price_to_compare_threshold()
 	today_hourly_details = (today_data or {}).get("hourlyPriceDetails") or []
 	tomorrow_hourly_details = (tomorrow_data or {}).get("hourlyPriceDetails") or []
-	ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
-	if screen_mode == "analysis":
+	if ai_enabled:
+		ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
+	if screen_mode == "analysis" and ai_enabled:
 		return render_analysis_screen(
 			output=output,
 			clear_screen=True,
@@ -1298,6 +1301,7 @@ def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analy
 		now=now,
 		start_analysis=False,
 		rate_view=rate_view,
+		ai_enabled=ai_enabled,
 		today_data=today_data,
 		tomorrow_data=tomorrow_data,
 	)
@@ -1306,6 +1310,7 @@ def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analy
 
 def run_refresh_loop(args, output=None):
 	output = output or sys.stdout
+	ai_enabled = not args.noai
 	next_delay = seconds_until_next_minute()
 	screen_mode = "rates"
 	rate_view = "today"
@@ -1333,9 +1338,9 @@ def run_refresh_loop(args, output=None):
 					if screen_mode == "analysis":
 						_update_analysis_countdown_line(next_refresh_at, output=output)
 					else:
-						_update_countdown_line(next_refresh_at, output=output, rate_view=rate_view)
+						_update_countdown_line(next_refresh_at, output=output, rate_view=rate_view, ai_enabled=ai_enabled)
 					key = read_key(timeout=1)
-					if key in {"i", "I"}:
+					if ai_enabled and key in {"i", "I"}:
 						screen_mode = "analysis" if screen_mode == "rates" else "rates"
 						if screen_mode == "analysis":
 							analysis_scroll = 0
@@ -1398,7 +1403,7 @@ def run_refresh_loop(args, output=None):
 				if screen_mode == "analysis":
 					_update_analysis_countdown_line(next_refresh_at, output=output)
 				else:
-					_update_countdown_line(next_refresh_at, output=output, rate_view=rate_view)
+					_update_countdown_line(next_refresh_at, output=output, rate_view=rate_view, ai_enabled=ai_enabled)
 			finally:
 				timer.cancel()
 
@@ -1418,13 +1423,18 @@ def parse_args(argv=None):
 		action="store_true",
 		help="Render once and exit instead of refreshing every minute.",
 	)
+	parser.add_argument(
+		"--noai",
+		action="store_true",
+		help="Disable all AI analysis and hide AI controls.",
+	)
 	return parser.parse_args(argv)
 
 
 def main(argv=None):
 	args = parse_args(argv)
 	if args.once:
-		render_screen(bar=args.bar, start_analysis=False)
+		render_screen(bar=args.bar, start_analysis=False, ai_enabled=not args.noai)
 		return
 	run_refresh_loop(args)
 

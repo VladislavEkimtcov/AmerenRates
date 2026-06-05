@@ -101,30 +101,28 @@ class ComboFormattingTests(unittest.TestCase):
 
         self.assertEqual(line, " [i] AI [t] Today        :42 ")
 
-    def test_needed_analysis_jobs_detects_daily_and_hourly_misses(self):
+    def test_needed_analysis_jobs_detects_daily_bundle_miss(self):
         jobs = combo._needed_analysis_jobs({}, now=datetime(2026, 4, 24, 3, 15))
 
-        self.assertEqual(jobs, [("daily", "daily:2026-04-24"), ("hourly", "hourly:2026-04-24T03")])
+        self.assertEqual(jobs, [("daily", "daily:2026-04-24")])
 
-    def test_needed_analysis_jobs_detects_new_hour(self):
+    def test_needed_analysis_jobs_does_not_rerun_for_new_hour_when_daily_bundle_exists(self):
         thoughts = {
             "date": "2026-04-24",
             "daily_statement": "Today is cheap overnight.",
-            "hour_key": "2026-04-24T02",
-            "hourly_statement": "Do laundry now.",
+            "hourly_statements": {f"{hour:02d}:00": f"Hour {hour} summary." for hour in range(24)},
         }
 
         jobs = combo._needed_analysis_jobs(thoughts, now=datetime(2026, 4, 24, 3, 0))
 
-        self.assertEqual(jobs, [("hourly", "hourly:2026-04-24T03")])
+        self.assertEqual(jobs, [])
 
     def test_needed_analysis_jobs_adds_tomorrow_daily_when_rates_are_available(self):
         tomorrow_details = [{"hour": f"{hour:02d}", "price": 0.01 * hour} for hour in range(1, 25)]
         thoughts = {
             "date": "2026-04-24",
             "daily_statement": "Today summary.",
-            "hour_key": "2026-04-24T03",
-            "hourly_statement": "This hour summary.",
+            "hourly_statements": {f"{hour:02d}:00": f"Hour {hour} summary." for hour in range(24)},
         }
 
         jobs = combo._needed_analysis_jobs(
@@ -563,16 +561,13 @@ class ComboFormattingTests(unittest.TestCase):
     def test_analysis_display_shows_latest_token_rate(self):
         thoughts = {
             "date": "2026-04-24",
-            "hour_key": "2026-04-24T03",
             "analysis_status": "ready",
             "analysis_error": "",
             "model": "deepseek-r1:70b",
             "daily_statement": "Daily summary.",
             "daily_generated_at": "2026-04-24T03:14:04",
             "daily_stats": {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2},
-            "hourly_statement": "Hourly summary.",
-            "hourly_generated_at": "2026-04-24T03:14:16",
-            "hourly_stats": {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4},
+            "hourly_statements": {f"{hour:02d}:00": f"Hour {hour} summary." for hour in range(24)},
         }
 
         with (
@@ -581,17 +576,16 @@ class ComboFormattingTests(unittest.TestCase):
         ):
             text = combo._analysis_display_text(now=datetime(2026, 4, 24, 3, 15))
 
-        self.assertIn("Ready from deepseek-r1:70b at 12.3t/s.", text)
+        self.assertIn("Ready from deepseek-r1:70b at 9.8t/s.", text)
 
     def test_analysis_display_includes_tomorrow_outlook(self):
         thoughts = {
             "date": "2026-04-24",
-            "hour_key": "2026-04-24T03",
             "analysis_status": "ready",
             "analysis_error": "",
             "model": "deepseek-r1:70b",
             "daily_statement": "Daily summary.",
-            "hourly_statement": "Hourly summary.",
+            "hourly_statements": {f"{hour:02d}:00": f"Hour {hour} summary." for hour in range(24)},
             "tomorrow_date": "2026-04-25",
             "tomorrow_daily_statement": "Tomorrow spikes in the evening.",
             "tomorrow_daily_stats": {"tokens": 22, "tok_per_sec": 4.8, "elapsed": 4.6},
@@ -620,7 +614,7 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertIn("NO INTERNET - no cached today rates available.", text)
         self.assertIn("NO INTERNET - no cached tomorrow rates available.", text)
 
-    def test_run_rate_analysis_jobs_persists_stats(self):
+    def test_run_rate_analysis_jobs_persists_daily_bundle_and_stats(self):
         with tempfile.TemporaryDirectory() as tmp:
             now = datetime(2026, 4, 24, 3, 15)
             config = {
@@ -632,8 +626,10 @@ class ComboFormattingTests(unittest.TestCase):
                 "extra_prompt": "",
             }
             responses = [
-                ("Daily summary.", {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2}),
-                ("Hourly summary.", {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4}),
+                (json.dumps({
+                    "daily_summary": "Daily summary.",
+                    "hourly_summaries": {f"{hour:02d}:00": f"Hour {hour} summary." for hour in range(24)},
+                }), {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2}),
                 ("Tomorrow outlook.", {"tokens": 30, "tok_per_sec": 10.0, "elapsed": 3.0}),
             ]
             tomorrow_details = [{"hour": f"{hour:02d}", "price": 0.02 * hour} for hour in range(1, 25)]
@@ -641,7 +637,9 @@ class ComboFormattingTests(unittest.TestCase):
             with (
                 mock.patch.object(combo, "BASE_DIR", Path(tmp)),
                 mock.patch.object(combo, "load_rate_prompt_template", return_value="Kind={{ANALYSIS_KIND}}\n{{RATE_DATA}}"),
-                mock.patch.object(combo, "build_rate_analysis_context", return_value={"hourly_prices": []}),
+                mock.patch.object(combo, "build_rate_analysis_context", return_value={
+                    "hourly_prices": [{"hour": f"{hour:02d}:00"} for hour in range(24)]
+                }),
                 mock.patch.object(combo, "query_rate_llm", side_effect=responses),
             ):
                 combo._run_rate_analysis_jobs(
@@ -649,7 +647,6 @@ class ComboFormattingTests(unittest.TestCase):
                     now,
                     [
                         ("daily", "daily:2026-04-24"),
-                        ("hourly", "hourly:2026-04-24T03"),
                         ("tomorrow_daily", "tomorrow_daily:2026-04-25"),
                     ],
                     config,
@@ -660,8 +657,7 @@ class ComboFormattingTests(unittest.TestCase):
         self.assertEqual(thoughts["analysis_status"], "ready")
         self.assertEqual(thoughts["daily_statement"], "Daily summary.")
         self.assertEqual(thoughts["daily_stats"], {"tokens": 120, "tok_per_sec": 9.8, "elapsed": 12.2})
-        self.assertEqual(thoughts["hourly_statement"], "Hourly summary.")
-        self.assertEqual(thoughts["hourly_stats"], {"tokens": 42, "tok_per_sec": 12.3, "elapsed": 3.4})
+        self.assertEqual(thoughts["hourly_statements"]["03:00"], "Hour 3 summary.")
         self.assertEqual(thoughts["tomorrow_date"], "2026-04-25")
         self.assertEqual(thoughts["tomorrow_daily_statement"], "Tomorrow outlook.")
         self.assertEqual(thoughts["tomorrow_daily_stats"], {"tokens": 30, "tok_per_sec": 10.0, "elapsed": 3.0})

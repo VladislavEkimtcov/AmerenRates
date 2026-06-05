@@ -536,6 +536,8 @@ def load_rate_prompt_template():
 		"You are an electricity rate analyst. Analyze the provided Ameren hourly "
 		"rate data and return concise practical guidance.\n\n"
 		"Analysis kind: {{ANALYSIS_KIND}}\n\n"
+		"For daily analysis, return JSON with daily_summary and hourly_summaries. "
+		"For tomorrow_daily analysis, return one sentence only.\n\n"
 		"{{EXTRA_PROMPT}}\n\n"
 		"RATE DATA:\n{{RATE_DATA}}\n"
 	)
@@ -656,6 +658,110 @@ def build_rate_analysis_context(hourly_details, now=None):
 	}
 
 
+def _strip_code_fences(text):
+	stripped = (text or "").strip()
+	if not stripped.startswith("```"):
+		return stripped
+
+	lines = stripped.splitlines()
+	if lines:
+		lines = lines[1:]
+	if lines and lines[-1].strip() == "```":
+		lines = lines[:-1]
+	return "\n".join(lines).strip()
+
+
+def _normalize_statement_hour_key(value):
+	if value is None:
+		return ""
+
+	if isinstance(value, int):
+		hour = value
+	else:
+		text = str(value).strip()
+		if not text:
+			return ""
+		if text.endswith(":00"):
+			text = text.split(":", 1)[0]
+		elif ":" in text:
+			match = re.match(r"^(\d{1,2})\s*:", text)
+			if not match:
+				return ""
+			text = match.group(1)
+		if not text.isdigit():
+			return ""
+		hour = int(text)
+
+	if hour == 24:
+		hour = 0
+	if 0 <= hour <= 23:
+		return f"{hour:02d}:00"
+	return ""
+
+
+def _normalize_hourly_statements(raw_statements, expected_hours):
+	expected_hours = list(expected_hours or [])
+	if not expected_hours:
+		return {}
+
+	normalized = {}
+	items = []
+	if isinstance(raw_statements, dict):
+		items = list(raw_statements.items())
+	elif isinstance(raw_statements, list):
+		for item in raw_statements:
+			if not isinstance(item, dict):
+				continue
+			items.append((
+				item.get("hour"),
+				item.get("summary") or item.get("statement") or item.get("text") or item.get("message"),
+			))
+
+	for raw_hour, raw_statement in items:
+		hour_key = _normalize_statement_hour_key(raw_hour)
+		if not hour_key:
+			continue
+		statement = str(raw_statement or "").strip()
+		if statement:
+			normalized[hour_key] = " ".join(statement.split())
+
+	missing = [hour for hour in expected_hours if hour not in normalized]
+	if missing:
+		raise ValueError(
+			"Daily analysis is missing hourly summaries for: {}".format(
+				", ".join(missing[:6])
+			)
+		)
+
+	return {hour: normalized[hour] for hour in expected_hours}
+
+
+def _parse_daily_analysis_response(raw, expected_hours):
+	payload_text = _strip_code_fences(raw)
+	try:
+		payload = json.loads(payload_text)
+	except (TypeError, ValueError) as exc:
+		raise ValueError("Daily analysis must be valid JSON.") from exc
+
+	if not isinstance(payload, dict):
+		raise ValueError("Daily analysis must be a JSON object.")
+
+	statement = ""
+	for key in ("daily_summary", "daily_statement", "summary"):
+		value = payload.get(key)
+		if isinstance(value, str) and value.strip():
+			statement = " ".join(value.split())
+			break
+	if not statement:
+		raise ValueError("Daily analysis JSON is missing daily_summary.")
+
+	hourly_statements = _normalize_hourly_statements(
+		payload.get("hourly_summaries") or payload.get("hourly_statements"),
+		expected_hours,
+	)
+	return statement, hourly_statements
+
+
 def build_rate_prompt(template, analysis_kind, context, config):
 	extra_prompt = config.get("extra_prompt") or ""
 	template = template.replace("{{ANALYSIS_KIND}}", analysis_kind)
@@ -670,10 +776,9 @@ def build_rate_prompt(template, analysis_kind, context, config):
 def _needed_analysis_jobs(thoughts, now=None, tomorrow_details=None):
 	date_key, hour_key = _analysis_keys(now)
 	jobs = []
-	if thoughts.get("date") != date_key or not thoughts.get("daily_statement"):
+	hourly_statements = thoughts.get("hourly_statements") or {}
+	if thoughts.get("date") != date_key or not thoughts.get("daily_statement") or len(hourly_statements) < 24:
 		jobs.append(("daily", f"daily:{date_key}"))
-	if thoughts.get("hour_key") != hour_key or not thoughts.get("hourly_statement"):
-		jobs.append(("hourly", f"hourly:{hour_key}"))
 	if tomorrow_details:
 		tomorrow_date_key = _tomorrow_analysis_date(now)
 		if thoughts.get("tomorrow_date") != tomorrow_date_key or not thoughts.get("tomorrow_daily_statement"):
@@ -683,7 +788,17 @@ def _needed_analysis_jobs(thoughts, now=None, tomorrow_details=None):
 
 def _clear_stale_analysis_fields(thoughts, date_key, hour_key, tomorrow_date_key=None):
 	if thoughts.get("date") != date_key:
-		for key in ("daily_statement", "daily_generated_at", "daily_stats"):
+		for key in (
+			"date",
+			"hour_key",
+			"daily_statement",
+			"daily_generated_at",
+			"daily_stats",
+			"hourly_statement",
+			"hourly_generated_at",
+			"hourly_stats",
+			"hourly_statements",
+		):
 			thoughts.pop(key, None)
 	if thoughts.get("hour_key") != hour_key:
 		for key in ("hourly_statement", "hourly_generated_at", "hourly_stats"):
@@ -695,7 +810,8 @@ def _clear_stale_analysis_fields(thoughts, date_key, hour_key, tomorrow_date_key
 
 def _start_rate_analysis_worker_locked():
 	global RATE_ANALYSIS_WORKER
-	if RATE_ANALYSIS_WORKER and RATE_ANALYSIS_WORKER.is_alive():
+	worker = RATE_ANALYSIS_WORKER
+	if worker is not None and worker.is_alive():
 		return
 	RATE_ANALYSIS_WORKER = threading.Thread(target=_analysis_worker_loop, daemon=True)
 	RATE_ANALYSIS_WORKER.start()
@@ -754,19 +870,16 @@ def _job_hourly_details(analysis_kind, hourly_details, tomorrow_hourly_details):
 
 
 def _job_prompt_kind(analysis_kind):
-	return "daily" if analysis_kind == "tomorrow_daily" else analysis_kind
+	return analysis_kind
 
 
-def _save_analysis_result(thoughts, analysis_kind, statement, stats, now, tomorrow_date_key):
+def _save_analysis_result(thoughts, analysis_kind, statement, stats, now, tomorrow_date_key, hourly_statements=None):
 	generated_at = datetime.now().isoformat(timespec="seconds")
 	if analysis_kind == "daily":
 		thoughts["daily_statement"] = statement
+		thoughts["hourly_statements"] = hourly_statements or {}
 		thoughts["daily_generated_at"] = generated_at
 		thoughts["daily_stats"] = stats
-	elif analysis_kind == "hourly":
-		thoughts["hourly_statement"] = statement
-		thoughts["hourly_generated_at"] = generated_at
-		thoughts["hourly_stats"] = stats
 	else:
 		thoughts["tomorrow_date"] = tomorrow_date_key
 		thoughts["tomorrow_daily_statement"] = statement
@@ -799,10 +912,17 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config, tomorrow_hourly_d
 			if not job_details:
 				continue
 			context = build_rate_analysis_context(job_details, now=_job_runtime(analysis_kind, now))
-			statement, stats = query_rate_llm(
+			raw_response, stats = query_rate_llm(
 				build_rate_prompt(template, _job_prompt_kind(analysis_kind), context, config),
 				config,
 			)
+			hourly_statements = None
+			statement = raw_response
+			if analysis_kind == "daily":
+				expected_hours = [record.get("hour") for record in context.get("hourly_prices") or [] if record.get("hour")]
+				if not expected_hours:
+					expected_hours = [record.get("hour") for record in _rate_records(job_details) if record.get("hour")]
+				statement, hourly_statements = _parse_daily_analysis_response(raw_response, expected_hours)
 			with RATE_ANALYSIS_LOCK:
 				thoughts = load_rate_thoughts()
 				thoughts["date"] = date_key
@@ -810,7 +930,15 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config, tomorrow_hourly_d
 				thoughts["model"] = config["model"]
 				thoughts["analysis_status"] = "running"
 				thoughts["analysis_error"] = ""
-				_save_analysis_result(thoughts, analysis_kind, statement, stats, now, tomorrow_date_key)
+				_save_analysis_result(
+					thoughts,
+					analysis_kind,
+					statement,
+					stats,
+					now,
+					tomorrow_date_key,
+					hourly_statements=hourly_statements,
+				)
 				save_rate_thoughts(thoughts)
 	except Exception as exc:
 		with RATE_ANALYSIS_LOCK:
@@ -1109,6 +1237,7 @@ def _analysis_display_text(now=None):
 	thoughts = load_rate_thoughts()
 	date_key, hour_key = _analysis_keys(now)
 	tomorrow_date_key = _tomorrow_analysis_date(now)
+	current_hour = f"{now.hour:02d}:00"
 	today_cached = load_cached_rates(now=now)
 	today_error_kind = _load_rate_cache_entry(now=now).get("error_kind", "")
 	tomorrow_daily = thoughts.get("tomorrow_daily_statement") if thoughts.get("tomorrow_date") == tomorrow_date_key else ""
@@ -1130,15 +1259,20 @@ def _analysis_display_text(now=None):
 	status = thoughts.get("analysis_status", "idle")
 	error = thoughts.get("analysis_error", "")
 	daily = thoughts.get("daily_statement") if thoughts.get("date") == date_key else ""
-	hourly = thoughts.get("hourly_statement") if thoughts.get("hour_key") == hour_key else ""
+	hourly_statements = thoughts.get("hourly_statements") if thoughts.get("date") == date_key else {}
+	hourly = ""
+	if isinstance(hourly_statements, dict):
+		hourly = str(hourly_statements.get(current_hour, "") or "").strip()
+	if not hourly and thoughts.get("hour_key") == hour_key:
+		hourly = str(thoughts.get("hourly_statement", "") or "").strip()
 
 	sections = []
 	if hourly:
-		sections.append(f"## Hourly action ({hour_key})\n{hourly}")
+		sections.append(f"## Hourly action ({current_hour})\n{hourly}")
 	elif not today_cached:
-		sections.append(f"## Hourly action ({hour_key})\n{_rate_unavailable_text('today', today_error_kind)}")
+		sections.append(f"## Hourly action ({current_hour})\n{_rate_unavailable_text('today', today_error_kind)}")
 	else:
-		sections.append(f"## Hourly action ({hour_key})\nAnalysis is warming up.")
+		sections.append(f"## Hourly action ({current_hour})\nAnalysis is warming up.")
 
 	if daily:
 		sections.append(f"## Daily analysis ({date_key})\n{daily}")
@@ -1165,8 +1299,6 @@ def _analysis_display_text(now=None):
 		stats_candidates = []
 		if thoughts.get("date") == date_key and isinstance(thoughts.get("daily_stats"), dict):
 			stats_candidates.append((thoughts.get("daily_generated_at", ""), thoughts["daily_stats"]))
-		if thoughts.get("hour_key") == hour_key and isinstance(thoughts.get("hourly_stats"), dict):
-			stats_candidates.append((thoughts.get("hourly_generated_at", ""), thoughts["hourly_stats"]))
 		if thoughts.get("tomorrow_date") == tomorrow_date_key and isinstance(thoughts.get("tomorrow_daily_stats"), dict):
 			stats_candidates.append((thoughts.get("tomorrow_daily_generated_at", ""), thoughts["tomorrow_daily_stats"]))
 		latest_stats = max(stats_candidates, default=("", {}))[1]

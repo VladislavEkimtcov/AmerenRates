@@ -1,7 +1,8 @@
 import html
 import json
 import re
-from datetime import date
+from datetime import date, datetime
+from pathlib import Path
 
 import requests
 
@@ -14,6 +15,14 @@ PTC_PATTERN = re.compile(
 	re.IGNORECASE,
 )
 
+# Key stored in the cache dict to track when the last failed fetch happened,
+# so that failures are retried once per hour rather than cached for the whole day.
+_FAILED_HOUR_KEY = "__last_failed_hour__"
+
+
+def _current_hour_key(now=None):
+	return (now or datetime.now()).strftime("%Y-%m-%dT%H")
+
 
 def extract_price_to_compare(page_html):
 	decoded_html = html.unescape(page_html)
@@ -23,12 +32,16 @@ def extract_price_to_compare(page_html):
 	return match.group(1)
 
 
-def _write_ptc_cache(cache_date, price, filename=PTC_FILENAME):
-	with open(filename, "w") as f:
-		json.dump({cache_date: price}, f)
+def _write_ptc_cache(cache_date, price, filename=PTC_FILENAME, now=None):
+	payload = {cache_date: price}
+	if price == PTC_FAILURE_VALUE:
+		payload[_FAILED_HOUR_KEY] = _current_hour_key(now)
+	path = Path(filename)
+	with path.open("w", encoding="utf-8") as f:
+		json.dump(payload, f)
 
 
-def refresh_price_to_compare(cache_date=None, filename=PTC_FILENAME, url=PTC_URL):
+def refresh_price_to_compare(cache_date=None, filename=PTC_FILENAME, url=PTC_URL, now=None):
 	cache_date = cache_date or date.today().isoformat()
 	try:
 		response = requests.get(url, timeout=10)
@@ -37,19 +50,36 @@ def refresh_price_to_compare(cache_date=None, filename=PTC_FILENAME, url=PTC_URL
 	except Exception:
 		price = PTC_FAILURE_VALUE
 
-	_write_ptc_cache(cache_date, price, filename=filename)
+	_write_ptc_cache(cache_date, price, filename=filename, now=now)
 	return price
 
 
-def get_cached_price_to_compare(cache_date=None, filename=PTC_FILENAME):
+def get_cached_price_to_compare(cache_date=None, filename=PTC_FILENAME, now=None):
+	"""Return the cached PTC for *cache_date*, fetching fresh data when needed.
+
+	A ``PTC_FAILURE_VALUE`` result is only reused within the same clock-hour it
+	was cached.  On the next hour (or on startup if the last attempt was a
+	different hour) the fetch is retried so that a transient network outage does
+	not suppress the PTC for the entire day.
+	"""
 	cache_date = cache_date or date.today().isoformat()
 	try:
-		with open(filename, "r") as f:
+		path = Path(filename)
+		with path.open("r", encoding="utf-8") as f:
 			cached = json.load(f)
-	except (FileNotFoundError, json.JSONDecodeError):
-		return refresh_price_to_compare(cache_date, filename=filename)
+	except (OSError, json.JSONDecodeError):
+		return refresh_price_to_compare(cache_date, filename=filename, now=now)
 
 	if not isinstance(cached, dict) or cache_date not in cached:
-		return refresh_price_to_compare(cache_date, filename=filename)
+		return refresh_price_to_compare(cache_date, filename=filename, now=now)
 
-	return cached.get(cache_date, PTC_FAILURE_VALUE)
+	value = cached[cache_date]
+
+	# If the previously-cached result was a failure, retry once per hour so
+	# that transient outages at startup or during the day are self-healing.
+	if value == PTC_FAILURE_VALUE:
+		last_failed_hour = cached.get(_FAILED_HOUR_KEY, "")
+		if last_failed_hour != _current_hour_key(now):
+			return refresh_price_to_compare(cache_date, filename=filename, now=now)
+
+	return value

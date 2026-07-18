@@ -166,8 +166,18 @@ def main(argv=None):
     args = parse_args(argv)
     data = fetch_or_load_rates()
     hourly_details = data.get("hourlyPriceDetails") or []
-    table = build_table(hourly_details, bar=args.bar)
-    print(tabulate(table, headers=["Hour", "AM", "PM"], tablefmt="plain"))
+
+    now = datetime.now()
+    table = build_table(hourly_details, now=now, bar=args.bar)
+
+    if now.hour >= 12:
+        filtered_table = [[row[0], row[2]] for row in table]
+        headers = ["Hour", "PM"]
+    else:
+        filtered_table = [[row[0], row[1]] for row in table]
+        headers = ["Hour", "AM"]
+
+    print(tabulate(filtered_table, headers=headers, tablefmt="plain"))
 
 
 if __name__ == "__main__":

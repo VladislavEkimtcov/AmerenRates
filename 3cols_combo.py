@@ -1291,6 +1291,16 @@ def _analysis_display_text(now=None):
 			f"{_rate_unavailable_text('tomorrow', tomorrow_error_kind, require_next_day=True)}"
 		)
 
+	cached_price_to_compare = get_cached_price_to_compare(date_key)
+	if cached_price_to_compare != PTC_FAILURE_VALUE:
+		try:
+			ptc_value = float(cached_price_to_compare)
+			sections.append(f"### Price to compare\n{CENT}{ptc_value:.1f}/kWh (cached)")
+		except (TypeError, ValueError):
+			sections.append("### Price to compare\nCached value unavailable.")
+	else:
+		sections.append("### Price to compare\nCached value unavailable.")
+
 	if status == "running":
 		sections.append("### Status\nGenerating in the background.")
 	elif status == "error" and error:

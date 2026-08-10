@@ -52,8 +52,21 @@ KEY_PAGE_UP = "PAGE_UP"
 KEY_PAGE_DOWN = "PAGE_DOWN"
 KEY_MOUSE_UP = "MOUSE_UP"
 KEY_MOUSE_DOWN = "MOUSE_DOWN"
-MOUSE_ENABLE = "\033[?1000h\033[?1006h"
+# NOTE: we deliberately never turn mouse reporting on.  On macOS, Terminal.app
+# and iTerm2 translate the scroll wheel into ↑/↓ key presses while the
+# alternate screen is active — complete with trackpad momentum and
+# acceleration.  Enabling ?1000/?1006 replaces that smooth stream with
+# discrete, momentum-free button-64/65 events, which is what made this screen
+# feel choppy.  The decoder below still understands the wheel events in case
+# something upstream (tmux, a terminal with mouse mode forced on) sends them.
 MOUSE_DISABLE = "\033[?1000l\033[?1006l"
+ENTER_ALT_SCREEN = "\033[?1049h"
+EXIT_ALT_SCREEN = "\033[?1049l"
+HIDE_CURSOR = "\033[?25l"
+SHOW_CURSOR = "\033[?25h"
+CLEAR_TO_EOL = "\033[K"
+ANALYSIS_LINES_TTL = 1.0
+MOUSE_SCROLL_STEP = 3
 REFRESH_SECONDS = 60
 REQUEST_TIMEOUT_SECONDS = 50
 BASE_DIR = Path(__file__).resolve().parent
@@ -334,6 +347,9 @@ def fetch_or_load_rates(target_date=None, cache_filename=None, require_next_day=
 				return None
 		elif cached_data is not None:
 			return cached_data
+		# A previous fetch failed; retry once per hour instead of every refresh.
+		elif cached.get("last_checked_hour") == _hour_key_for_time(now) and "iso" in attempted_formats:
+			return None
 
 	checked_at = now.isoformat(timespec="seconds")
 	last_checked_hour = _hour_key_for_time(now)
@@ -1226,9 +1242,29 @@ def _render_analysis_markdown_line(line):
 	return _apply_inline_markdown(f"{indent}{stripped}", base_style=base_style)
 
 
+_ANALYSIS_LINES_CACHE = {"width": None, "lines": [], "stamp": 0.0}
+
+
+def invalidate_analysis_lines_cache():
+	_ANALYSIS_LINES_CACHE["stamp"] = 0.0
+
+
 def _analysis_lines(now=None, width=None):
 	width = width or _terminal_size()[0]
-	return _wrap_analysis_text(_analysis_display_text(now=now), width - 1)
+	# Building this list re-reads several JSON caches from disk and re-wraps
+	# every paragraph.  Scrolling must not pay that cost per keystroke, so hold
+	# the result for a beat; the background analysis only ever updates on the
+	# order of seconds anyway, and the refresh tick invalidates explicitly.
+	now_mono = time.monotonic()
+	if (
+		_ANALYSIS_LINES_CACHE["width"] == width
+		and now_mono - _ANALYSIS_LINES_CACHE["stamp"] < ANALYSIS_LINES_TTL
+	):
+		return _ANALYSIS_LINES_CACHE["lines"]
+
+	lines = _wrap_analysis_text(_analysis_display_text(now=now), width - 1)
+	_ANALYSIS_LINES_CACHE.update({"width": width, "lines": lines, "stamp": now_mono})
+	return lines
 
 
 def _analysis_display_text(now=None):
@@ -1322,6 +1358,15 @@ def _analysis_display_text(now=None):
 
 
 def render_analysis_screen(output=None, clear_screen=False, next_refresh_at=None, now=None, scroll=0):
+	"""Repaint the analysis screen in a single write.
+
+	The frame is assembled as one string and pushed with one write/flush.
+	There is no ``\\033[2J`` and no per-line ``print`` — a full clear plus a
+	write syscall per row is exactly what makes scrolling tear and flash.
+	Every row is overwritten in place and terminated with erase-to-EOL
+	instead, so the screen never blanks between frames.  *clear_screen* is
+	accepted for call-site compatibility but is no longer needed.
+	"""
 	output = output or sys.stdout
 	now = now or datetime.now()
 	width, height = _terminal_size()
@@ -1330,14 +1375,19 @@ def render_analysis_screen(output=None, clear_screen=False, next_refresh_at=None
 	max_scroll = max(0, len(lines) - body_height)
 	scroll = min(max(0, scroll), max_scroll)
 
-	if clear_screen:
-		print(CLEAR_SCREEN, end="", file=output)
+	visible = lines[scroll:scroll + body_height]
+	rows = [_render_analysis_markdown_line(line[:width - 1]) for line in visible]
+	# Pad out so rows left over from a longer previous frame get erased.
+	rows.extend([""] * (body_height - len(rows)))
+	if height >= 3:
+		rows.append("")  # the spacer row just above the bottom bar
 
-	for line in lines[scroll:scroll + body_height]:
-		print(_render_analysis_markdown_line(line[:width - 1]), file=output)
-
+	frame = ["\033[H", f"{CLEAR_TO_EOL}\r\n".join(rows), CLEAR_TO_EOL]
 	if next_refresh_at is not None:
-		_write_analysis_bottom_bar(next_refresh_at, output=output, now=now)
+		bar = _analysis_bottom_bar_line(next_refresh_at, now=now, width=width)
+		frame.append(f"\033[{height};1H\r{CLEAR_LINE}{bar}")
+
+	output.write("".join(frame))
 	output.flush()
 	return max_scroll
 
@@ -1370,49 +1420,95 @@ def _decode_terminal_key(sequence):
 	return sequence
 
 
+_ESCAPE_SEQUENCE_END_RE = re.compile(r"\x1b\[(?:[AB]|[56]~|<\d+;\d+;\d+[mM])$")
+
+
+def _split_keys(buffer):
+	"""Split *buffer* into decoded keys plus whatever tail is still partial.
+
+	Returns ``(keys, remainder)``.  A trailing incomplete escape sequence is
+	handed back so the next read can finish it, instead of being mangled.
+	"""
+	keys = []
+	index = 0
+	length = len(buffer)
+	while index < length:
+		char = buffer[index]
+		if char != "\x1b":
+			keys.append(char)
+			index += 1
+			continue
+
+		# Walk forward until the escape sequence terminates.
+		end = index + 1
+		matched = False
+		while end < length and end - index <= 32:
+			end += 1
+			candidate = buffer[index:end]
+			if _ESCAPE_SEQUENCE_END_RE.match(candidate):
+				matched = True
+				break
+			if candidate.startswith("\x1b[M") and len(candidate) >= 6:
+				matched = True
+				break
+		if not matched:
+			if length - index <= 32:
+				return keys, buffer[index:]  # incomplete — wait for more bytes
+			end = index + 1  # give up: treat the lone ESC as its own key
+		keys.append(_decode_terminal_key(buffer[index:end]))
+		index = end
+	return keys, ""
+
+
 @contextmanager
 def terminal_key_reader(input_stream=None):
 	input_stream = input_stream or sys.stdin
 	if not input_stream.isatty():
-		def no_key(timeout=0):
+		def no_keys(timeout=0):
 			if timeout:
 				time.sleep(timeout)
-			return ""
-		yield no_key
+			return []
+		yield no_keys
 		return
 
 	fd = input_stream.fileno()
 	old_settings = termios.tcgetattr(fd)
 	tty.setcbreak(fd)
-	sys.stdout.write(MOUSE_ENABLE)
+	# The alternate screen is what makes macOS terminals hand us the scroll
+	# wheel as ↑/↓ presses (with trackpad momentum) rather than nothing at all.
+	# Mouse reporting stays off on purpose — see the note by MOUSE_DISABLE.
+	sys.stdout.write(f"{MOUSE_DISABLE}{ENTER_ALT_SCREEN}{HIDE_CURSOR}{CLEAR_SCREEN}")
 	sys.stdout.flush()
+	pending = ""
 	try:
-		def read_key(timeout=0):
+		def read_keys(timeout=0):
+			"""Return every key available right now, waiting up to *timeout*.
+
+			Reading the whole burst in one go is the point: a single flick of
+			the wheel delivers dozens of arrow keys, and the caller can fold
+			them into one scroll step and one repaint instead of repainting
+			once per key and falling behind the input queue.
+			"""
+			nonlocal pending
 			ready, _, _ = select.select([input_stream], [], [], timeout)
-			if not ready:
-				return ""
-			first = input_stream.read(1)
-			if first != "\x1b":
-				return first
+			if not ready and not pending:
+				return []
 
-			sequence = [first]
-			while True:
-				ready, _, _ = select.select([input_stream], [], [], 0.01)
-				if not ready:
+			buffer = pending
+			pending = ""
+			while ready:
+				chunk = os.read(fd, 4096)
+				if not chunk:
 					break
-				sequence.append(input_stream.read(1))
-				joined = "".join(sequence)
-				if re.match(r"\x1b\[(?:[AB]|[56]~)$", joined):
-					break
-				if re.match(r"\x1b\[<\d+;\d+;\d+[mM]$", joined):
-					break
-				if joined.startswith("\x1b[M") and len(joined) >= 6:
-					break
-			return _decode_terminal_key("".join(sequence))
+				buffer += chunk.decode("utf-8", "replace")
+				ready, _, _ = select.select([input_stream], [], [], 0)
 
-		yield read_key
+			keys, pending = _split_keys(buffer)
+			return keys
+
+		yield read_keys
 	finally:
-		sys.stdout.write(MOUSE_DISABLE)
+		sys.stdout.write(f"{SHOW_CURSOR}{EXIT_ALT_SCREEN}")
 		sys.stdout.flush()
 		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
@@ -1430,7 +1526,6 @@ def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analy
 	if screen_mode == "analysis" and ai_enabled:
 		return render_analysis_screen(
 			output=output,
-			clear_screen=True,
 			next_refresh_at=next_refresh_at,
 			now=now,
 			scroll=analysis_scroll,
@@ -1459,7 +1554,7 @@ def run_refresh_loop(args, output=None):
 	analysis_scroll = 0
 	analysis_max_scroll = 0
 
-	with terminal_key_reader() as read_key:
+	with terminal_key_reader() as read_keys:
 		while True:
 			next_refresh_at = datetime.now() + timedelta(seconds=next_delay)
 			refresh_ready = threading.Event()
@@ -1468,6 +1563,7 @@ def run_refresh_loop(args, output=None):
 			timer.start()
 
 			try:
+				invalidate_analysis_lines_cache()
 				analysis_max_scroll = _refresh_screen(
 					screen_mode,
 					rate_view,
@@ -1476,16 +1572,58 @@ def run_refresh_loop(args, output=None):
 					next_refresh_at,
 					analysis_scroll=analysis_scroll,
 				)
+				last_bar_text = None
 				while not refresh_ready.is_set():
-					if screen_mode == "analysis":
-						_update_analysis_countdown_line(next_refresh_at, output=output)
-					else:
-						_update_countdown_line(next_refresh_at, output=output, rate_view=rate_view, ai_enabled=ai_enabled)
-					key = read_key(timeout=1)
-					if ai_enabled and key in {"i", "I"}:
-						screen_mode = "analysis" if screen_mode == "rates" else "rates"
+					keys = read_keys(timeout=0.25)
+					if not keys:
+						# Idle: only touch the screen when the countdown text
+						# actually changed, so nothing competes with a repaint.
 						if screen_mode == "analysis":
-							analysis_scroll = 0
+							bar_text = _analysis_bottom_bar_plain_text(next_refresh_at)
+						else:
+							bar_text = _bottom_bar_plain_text(
+								next_refresh_at, rate_view=rate_view, ai_enabled=ai_enabled
+							)
+						if bar_text != last_bar_text:
+							last_bar_text = bar_text
+							if screen_mode == "analysis":
+								_update_analysis_countdown_line(next_refresh_at, output=output)
+							else:
+								_update_countdown_line(
+									next_refresh_at, output=output, rate_view=rate_view, ai_enabled=ai_enabled
+								)
+						continue
+
+					# Fold the whole burst into one scroll delta and one frame.
+					_, height = _terminal_size()
+					page_step = max(1, height - 3)
+					scroll_delta = 0
+					full_refresh = False
+					for key in keys:
+						if ai_enabled and key in {"i", "I"}:
+							screen_mode = "analysis" if screen_mode == "rates" else "rates"
+							if screen_mode == "analysis":
+								analysis_scroll = 0
+							scroll_delta = 0
+							full_refresh = True
+						elif key in {"q", "Q"}:
+							return
+						elif screen_mode == "rates":
+							if key in {"t", "T"}:
+								rate_view = "tomorrow" if rate_view == "today" else "today"
+								full_refresh = True
+						elif key in {KEY_UP, KEY_DOWN}:
+							scroll_delta += -1 if key == KEY_UP else 1
+						elif key in {KEY_MOUSE_UP, KEY_MOUSE_DOWN}:
+							# Only reached if something upstream forces mouse
+							# reporting on; those are discrete notches, not the
+							# momentum stream, so give them a bigger step.
+							scroll_delta += -MOUSE_SCROLL_STEP if key == KEY_MOUSE_UP else MOUSE_SCROLL_STEP
+						elif key in {KEY_PAGE_UP, KEY_PAGE_DOWN}:
+							scroll_delta += -page_step if key == KEY_PAGE_UP else page_step
+
+					if full_refresh:
+						invalidate_analysis_lines_cache()
 						analysis_max_scroll = _refresh_screen(
 							screen_mode,
 							rate_view,
@@ -1494,54 +1632,16 @@ def run_refresh_loop(args, output=None):
 							next_refresh_at,
 							analysis_scroll=analysis_scroll,
 						)
-					elif screen_mode == "rates" and key in {"t", "T"}:
-						rate_view = "tomorrow" if rate_view == "today" else "today"
-						analysis_max_scroll = _refresh_screen(
-							screen_mode,
-							rate_view,
-							args,
-							output,
-							next_refresh_at,
-							analysis_scroll=analysis_scroll,
-						)
-					elif screen_mode == "analysis" and key in {KEY_UP, KEY_MOUSE_UP}:
-						step = 3 if key == KEY_MOUSE_UP else 1
-						analysis_scroll = max(0, analysis_scroll - step)
+						last_bar_text = None
+					elif scroll_delta:
+						analysis_scroll = max(0, min(analysis_max_scroll, analysis_scroll + scroll_delta))
 						analysis_max_scroll = render_analysis_screen(
 							output=output,
-							clear_screen=True,
 							next_refresh_at=next_refresh_at,
 							scroll=analysis_scroll,
 						)
-					elif screen_mode == "analysis" and key in {KEY_DOWN, KEY_MOUSE_DOWN}:
-						step = 3 if key == KEY_MOUSE_DOWN else 1
-						analysis_scroll = min(analysis_max_scroll, analysis_scroll + step)
-						analysis_max_scroll = render_analysis_screen(
-							output=output,
-							clear_screen=True,
-							next_refresh_at=next_refresh_at,
-							scroll=analysis_scroll,
-						)
-					elif screen_mode == "analysis" and key == KEY_PAGE_UP:
-						_, height = _terminal_size()
-						analysis_scroll = max(0, analysis_scroll - max(1, height - 3))
-						analysis_max_scroll = render_analysis_screen(
-							output=output,
-							clear_screen=True,
-							next_refresh_at=next_refresh_at,
-							scroll=analysis_scroll,
-						)
-					elif screen_mode == "analysis" and key == KEY_PAGE_DOWN:
-						_, height = _terminal_size()
-						analysis_scroll = min(analysis_max_scroll, analysis_scroll + max(1, height - 3))
-						analysis_max_scroll = render_analysis_screen(
-							output=output,
-							clear_screen=True,
-							next_refresh_at=next_refresh_at,
-							scroll=analysis_scroll,
-						)
-					elif key in {"q", "Q"}:
-						return
+						analysis_scroll = min(analysis_scroll, analysis_max_scroll)
+						last_bar_text = None
 				if screen_mode == "analysis":
 					_update_analysis_countdown_line(next_refresh_at, output=output)
 				else:

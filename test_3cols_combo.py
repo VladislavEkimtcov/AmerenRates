@@ -63,6 +63,8 @@ class JsonRatesResponse:
 class ComboFormattingTests(unittest.TestCase):
     def tearDown(self):
         combo.HIGH_PRICE_THRESHOLD = 10
+        combo.RATE_ANALYSIS_IN_FLIGHT.clear()
+        combo.RATE_ANALYSIS_QUEUE.clear()
 
     def test_parse_args_uses_default_bar(self):
         args = combo.parse_args([])
@@ -717,6 +719,124 @@ class ComboFormattingTests(unittest.TestCase):
 
         run_refresh_loop.assert_called_once()
 
+    def test_is_html_response_detects_html_markup(self):
+        self.assertTrue(combo._is_html_response("<!DOCTYPE html><html><body>Error</body></html>"))
+        self.assertTrue(combo._is_html_response("  <html lang='en'>"))
+        self.assertTrue(combo._is_html_response("An error occurred: </body></html>"))
+        self.assertFalse(combo._is_html_response('{"daily_summary": "ok"}'))
+        self.assertFalse(combo._is_html_response("Tomorrow looks cheap."))
+
+    def test_ensure_rate_analysis_background_suppresses_retries_in_same_hour_after_failure(self):
+        now = datetime(2026, 4, 24, 3, 15)
+        today_details = [{"hour": f"{hour:02d}", "price": 0.01} for hour in range(1, 25)]
+        thoughts = {
+            "analysis_status": "error",
+            "analysis_error": "Connection error",
+            "last_failed_hour": "2026-04-24T03",
+        }
+
+        with (
+            mock.patch.object(combo, "rate_ai_is_configured", return_value=True),
+            mock.patch.object(combo, "load_rate_thoughts", return_value=thoughts),
+            mock.patch.object(combo, "_start_rate_analysis_worker_locked") as worker_mock,
+        ):
+            started = combo.ensure_rate_analysis_background(today_details, now=now, force=False)
+
+        self.assertFalse(started)
+        worker_mock.assert_not_called()
+
+    def test_ensure_rate_analysis_background_retries_in_next_hour_after_failure(self):
+        now = datetime(2026, 4, 24, 4, 0)
+        today_details = [{"hour": f"{hour:02d}", "price": 0.01} for hour in range(1, 25)]
+        thoughts = {
+            "analysis_status": "error",
+            "analysis_error": "Connection error",
+            "last_failed_hour": "2026-04-24T03",
+        }
+
+        with (
+            mock.patch.object(combo, "rate_ai_is_configured", return_value=True),
+            mock.patch.object(combo, "load_rate_thoughts", return_value=thoughts),
+            mock.patch.object(combo, "save_rate_thoughts"),
+            mock.patch.object(combo, "_start_rate_analysis_worker_locked") as worker_mock,
+        ):
+            started = combo.ensure_rate_analysis_background(today_details, now=now, force=False)
+
+        self.assertTrue(started)
+        worker_mock.assert_called_once()
+
+    def test_ensure_rate_analysis_background_forces_retry_when_forced(self):
+        now = datetime(2026, 4, 24, 3, 15)
+        today_details = [{"hour": f"{hour:02d}", "price": 0.01} for hour in range(1, 25)]
+        thoughts = {
+            "analysis_status": "error",
+            "analysis_error": "Connection error",
+            "last_failed_hour": "2026-04-24T03",
+        }
+
+        with (
+            mock.patch.object(combo, "rate_ai_is_configured", return_value=True),
+            mock.patch.object(combo, "load_rate_thoughts", return_value=thoughts),
+            mock.patch.object(combo, "save_rate_thoughts"),
+            mock.patch.object(combo, "_start_rate_analysis_worker_locked") as worker_mock,
+        ):
+            started = combo.ensure_rate_analysis_background(today_details, now=now, force=True)
+
+        self.assertTrue(started)
+        worker_mock.assert_called_once()
+
+    def test_run_rate_analysis_jobs_records_last_failed_hour_on_html_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            now = datetime(2026, 4, 24, 3, 15)
+            config = {
+                "endpoint": "http://127.0.0.1:6767/v1",
+                "api_key": "",
+                "model": "deepseek-r1:70b",
+                "temperature": 0.2,
+                "max_tokens": 700,
+                "extra_prompt": "",
+            }
+
+            with (
+                mock.patch.object(combo, "BASE_DIR", Path(tmp)),
+                mock.patch.object(combo, "load_rate_prompt_template", return_value="Kind={{ANALYSIS_KIND}}\n{{RATE_DATA}}"),
+                mock.patch.object(combo, "build_rate_analysis_context", return_value={"hourly_prices": []}),
+                mock.patch.object(combo, "query_rate_llm", return_value=("<!DOCTYPE html><html>Plug page</html>", {})),
+            ):
+                combo._run_rate_analysis_jobs(
+                    [{"hour": "03", "price": 0.042}],
+                    now,
+                    [("daily", "daily:2026-04-24")],
+                    config,
+                )
+                thoughts = combo.load_rate_thoughts()
+
+        self.assertEqual(thoughts["analysis_status"], "error")
+        self.assertIn("returned HTML plug page", thoughts["analysis_error"])
+        self.assertEqual(thoughts["last_failed_hour"], "2026-04-24T03")
+
+    def test_scroll_path_reuses_cached_analysis_lines_after_ttl(self):
+        calls = []
+
+        def fake_text(now=None):
+            calls.append(1)
+            return "\n".join(f"line {i}" for i in range(100))
+
+        out = io.StringIO()
+        with mock.patch.object(combo, "_terminal_size", return_value=(80, 20)), \
+                mock.patch.object(combo, "_analysis_display_text", side_effect=fake_text):
+            combo.invalidate_analysis_lines_cache()
+            combo.render_analysis_screen(output=out, scroll=0)
+            self.assertEqual(len(calls), 1)
+
+            combo.invalidate_analysis_lines_cache()  # TTL expired
+            combo.render_analysis_screen(output=out, scroll=5, allow_stale_lines=True)
+            self.assertEqual(len(calls), 1)
+
+            combo.render_analysis_screen(output=out, scroll=5)
+            self.assertEqual(len(calls), 2)
+
 
 if __name__ == "__main__":
     unittest.main()
+

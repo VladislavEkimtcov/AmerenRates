@@ -3,6 +3,7 @@ CACHE_FILENAME = "cached_rates.json"
 TOMORROW_CACHE_FILENAME = "tomorrow_cached.json"
 RATE_THOUGHTS_FILENAME = "rate_thoughts.json"
 RATE_PROMPT_FILENAME = "PROCESS_RATE_PROMPT.md"
+PID_FILENAME = "ameren_rates.pid"
 HIGH_PRICE_THRESHOLD = 10
 DEFAULT_bar = 5
 
@@ -14,6 +15,8 @@ import os
 import re
 import select
 import shutil
+import signal
+import subprocess
 import sys
 import termios
 import textwrap
@@ -62,12 +65,18 @@ KEY_MOUSE_DOWN = "MOUSE_DOWN"
 MOUSE_DISABLE = "\033[?1000l\033[?1006l"
 ENTER_ALT_SCREEN = "\033[?1049h"
 EXIT_ALT_SCREEN = "\033[?1049l"
+# Alternate scroll mode: an explicit "turn the wheel into arrow keys" request for
+# xterm-family terminals.  Terminal.app/iTerm2 do this natively and ignore it.
+ENTER_ALT_SCROLL = "\033[?1007h"
+EXIT_ALT_SCROLL = "\033[?1007l"
 HIDE_CURSOR = "\033[?25l"
 SHOW_CURSOR = "\033[?25h"
 CLEAR_TO_EOL = "\033[K"
 ANALYSIS_LINES_TTL = 1.0
 MOUSE_SCROLL_STEP = 3
 REFRESH_SECONDS = 60
+TERMINATE_GRACE_SECONDS = 5.0
+KILL_GRACE_SECONDS = 2.0
 REQUEST_TIMEOUT_SECONDS = 50
 BASE_DIR = Path(__file__).resolve().parent
 RATE_ANALYSIS_LOCK = threading.RLock()
@@ -752,7 +761,20 @@ def _normalize_hourly_statements(raw_statements, expected_hours):
 	return {hour: normalized[hour] for hour in expected_hours}
 
 
+def _is_html_response(text):
+	if not isinstance(text, str):
+		return False
+	stripped = text.strip().lower()
+	if stripped.startswith(("<html", "<!doctype", "<head", "<body")):
+		return True
+	if "</html>" in stripped or "</body>" in stripped:
+		return True
+	return False
+
+
 def _parse_daily_analysis_response(raw, expected_hours):
+	if _is_html_response(raw):
+		raise ValueError("Daily analysis response returned HTML instead of valid JSON.")
 	payload_text = _strip_code_fences(raw)
 	try:
 		payload = json.loads(payload_text)
@@ -814,6 +836,7 @@ def _clear_stale_analysis_fields(thoughts, date_key, hour_key, tomorrow_date_key
 			"hourly_generated_at",
 			"hourly_stats",
 			"hourly_statements",
+			"last_failed_hour",
 		):
 			thoughts.pop(key, None)
 	if thoughts.get("hour_key") != hour_key:
@@ -844,15 +867,19 @@ def _analysis_worker_loop():
 		_run_rate_analysis_jobs(*args)
 
 
-def ensure_rate_analysis_background(hourly_details, tomorrow_hourly_details=None, now=None):
+def ensure_rate_analysis_background(hourly_details, tomorrow_hourly_details=None, now=None, force=False):
 	now = now or datetime.now()
 	config = load_rate_ai_config()
 	tomorrow_hourly_details = tomorrow_hourly_details or []
 	if not (hourly_details or tomorrow_hourly_details) or not rate_ai_is_configured(config):
 		return False
 
+	current_hour_key = _hour_key_for_time(now)
 	with RATE_ANALYSIS_LOCK:
 		thoughts = load_rate_thoughts()
+		if not force and thoughts.get("analysis_status") == "error" and thoughts.get("last_failed_hour") == current_hour_key:
+			return False
+
 		jobs = [
 			job for job in _needed_analysis_jobs(thoughts, now, tomorrow_details=tomorrow_hourly_details)
 			if job[1] not in RATE_ANALYSIS_IN_FLIGHT
@@ -932,6 +959,8 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config, tomorrow_hourly_d
 				build_rate_prompt(template, _job_prompt_kind(analysis_kind), context, config),
 				config,
 			)
+			if _is_html_response(raw_response):
+				raise ValueError(f"{analysis_kind} response returned HTML plug page instead of valid response.")
 			hourly_statements = None
 			statement = raw_response
 			if analysis_kind == "daily":
@@ -965,6 +994,7 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config, tomorrow_hourly_d
 				"model": config["model"],
 				"analysis_status": "error",
 				"analysis_error": str(exc),
+				"last_failed_hour": _hour_key_for_time(now),
 			})
 			save_rate_thoughts(thoughts)
 	finally:
@@ -975,6 +1005,7 @@ def _run_rate_analysis_jobs(hourly_details, now, jobs, config, tomorrow_hourly_d
 			if not RATE_ANALYSIS_IN_FLIGHT and thoughts.get("analysis_status") != "error":
 				thoughts["analysis_status"] = "ready"
 				thoughts["analysis_error"] = ""
+				thoughts.pop("last_failed_hour", None)
 				save_rate_thoughts(thoughts)
 
 
@@ -1150,6 +1181,7 @@ def render_screen(
 	ai_enabled=True,
 	today_data=UNSET,
 	tomorrow_data=UNSET,
+	force_analysis=False,
 ):
 	output = output or sys.stdout
 	now = now or datetime.now()
@@ -1170,7 +1202,12 @@ def render_screen(
 		now=now,
 	).get("error_kind", "")
 	if ai_enabled and start_analysis:
-		ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
+		ensure_rate_analysis_background(
+			today_hourly_details,
+			tomorrow_hourly_details=tomorrow_hourly_details,
+			now=now,
+			force=force_analysis,
+		)
 	if rate_view == "tomorrow":
 		if tomorrow_hourly_details:
 			table = build_table(tomorrow_hourly_details, now=now, bar=bar, highlight_current_hour=False)
@@ -1249,8 +1286,17 @@ def invalidate_analysis_lines_cache():
 	_ANALYSIS_LINES_CACHE["stamp"] = 0.0
 
 
-def _analysis_lines(now=None, width=None):
+def _analysis_lines_are_stale(width):
+	return (
+		_ANALYSIS_LINES_CACHE["width"] != width
+		or time.monotonic() - _ANALYSIS_LINES_CACHE["stamp"] >= ANALYSIS_LINES_TTL
+	)
+
+
+def _analysis_lines(now=None, width=None, allow_stale=False):
 	width = width or _terminal_size()[0]
+	if allow_stale and _ANALYSIS_LINES_CACHE["width"] == width and _ANALYSIS_LINES_CACHE["lines"]:
+		return _ANALYSIS_LINES_CACHE["lines"]
 	# Building this list re-reads several JSON caches from disk and re-wraps
 	# every paragraph.  Scrolling must not pay that cost per keystroke, so hold
 	# the result for a beat; the background analysis only ever updates on the
@@ -1357,7 +1403,9 @@ def _analysis_display_text(now=None):
 	return "\n\n".join(sections)
 
 
-def render_analysis_screen(output=None, clear_screen=False, next_refresh_at=None, now=None, scroll=0):
+def render_analysis_screen(
+	output=None, clear_screen=False, next_refresh_at=None, now=None, scroll=0, allow_stale_lines=False
+):
 	"""Repaint the analysis screen in a single write.
 
 	The frame is assembled as one string and pushed with one write/flush.
@@ -1366,12 +1414,15 @@ def render_analysis_screen(output=None, clear_screen=False, next_refresh_at=None
 	Every row is overwritten in place and terminated with erase-to-EOL
 	instead, so the screen never blanks between frames.  *clear_screen* is
 	accepted for call-site compatibility but is no longer needed.
+
+	*allow_stale_lines* is for the scroll path: reuse the cached wrapped lines
+	regardless of TTL so scrolling only ever changes a slice index.
 	"""
 	output = output or sys.stdout
 	now = now or datetime.now()
 	width, height = _terminal_size()
 	body_height = max(1, height - 2)
-	lines = _analysis_lines(now=now, width=width)
+	lines = _analysis_lines(now=now, width=width, allow_stale=allow_stale_lines)
 	max_scroll = max(0, len(lines) - body_height)
 	scroll = min(max(0, scroll), max_scroll)
 
@@ -1477,7 +1528,7 @@ def terminal_key_reader(input_stream=None):
 	# The alternate screen is what makes macOS terminals hand us the scroll
 	# wheel as ↑/↓ presses (with trackpad momentum) rather than nothing at all.
 	# Mouse reporting stays off on purpose — see the note by MOUSE_DISABLE.
-	sys.stdout.write(f"{MOUSE_DISABLE}{ENTER_ALT_SCREEN}{HIDE_CURSOR}{CLEAR_SCREEN}")
+	sys.stdout.write(f"{MOUSE_DISABLE}{ENTER_ALT_SCREEN}{ENTER_ALT_SCROLL}{HIDE_CURSOR}{CLEAR_SCREEN}")
 	sys.stdout.flush()
 	pending = ""
 	try:
@@ -1508,12 +1559,12 @@ def terminal_key_reader(input_stream=None):
 
 		yield read_keys
 	finally:
-		sys.stdout.write(f"{SHOW_CURSOR}{EXIT_ALT_SCREEN}")
+		sys.stdout.write(f"{SHOW_CURSOR}{EXIT_ALT_SCROLL}{EXIT_ALT_SCREEN}")
 		sys.stdout.flush()
 		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
-def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analysis_scroll=0):
+def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analysis_scroll=0, force_analysis=False):
 	ai_enabled = not getattr(args, "noai", False)
 	now = datetime.now()
 	today_data = fetch_or_load_rates(now=now)
@@ -1522,7 +1573,12 @@ def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analy
 	today_hourly_details = (today_data or {}).get("hourlyPriceDetails") or []
 	tomorrow_hourly_details = (tomorrow_data or {}).get("hourlyPriceDetails") or []
 	if ai_enabled:
-		ensure_rate_analysis_background(today_hourly_details, tomorrow_hourly_details=tomorrow_hourly_details, now=now)
+		ensure_rate_analysis_background(
+			today_hourly_details,
+			tomorrow_hourly_details=tomorrow_hourly_details,
+			now=now,
+			force=force_analysis,
+		)
 	if screen_mode == "analysis" and ai_enabled:
 		return render_analysis_screen(
 			output=output,
@@ -1576,8 +1632,24 @@ def run_refresh_loop(args, output=None):
 				while not refresh_ready.is_set():
 					keys = read_keys(timeout=0.25)
 					if not keys:
-						# Idle: only touch the screen when the countdown text
-						# actually changed, so nothing competes with a repaint.
+						# Idle: only touch the screen when something actually changed,
+						# so nothing competes with a repaint.  This is also where the
+						# wrapped-line cache is rebuilt, keeping disk reads and
+						# re-wrapping off the scroll path.
+						if screen_mode == "analysis" and ai_enabled:
+							width = _terminal_size()[0]
+							if _analysis_lines_are_stale(width):
+								previous_lines = _ANALYSIS_LINES_CACHE["lines"]
+								if _analysis_lines(width=width) != previous_lines:
+									analysis_max_scroll = render_analysis_screen(
+										output=output,
+										next_refresh_at=next_refresh_at,
+										scroll=analysis_scroll,
+										allow_stale_lines=True,
+									)
+									analysis_scroll = min(analysis_scroll, analysis_max_scroll)
+									last_bar_text = None
+									continue
 						if screen_mode == "analysis":
 							bar_text = _analysis_bottom_bar_plain_text(next_refresh_at)
 						else:
@@ -1599,6 +1671,7 @@ def run_refresh_loop(args, output=None):
 					page_step = max(1, height - 3)
 					scroll_delta = 0
 					full_refresh = False
+					force_analysis = False
 					for key in keys:
 						if ai_enabled and key in {"i", "I"}:
 							screen_mode = "analysis" if screen_mode == "rates" else "rates"
@@ -1606,6 +1679,7 @@ def run_refresh_loop(args, output=None):
 								analysis_scroll = 0
 							scroll_delta = 0
 							full_refresh = True
+							force_analysis = True
 						elif key in {"q", "Q"}:
 							return
 						elif screen_mode == "rates":
@@ -1631,6 +1705,7 @@ def run_refresh_loop(args, output=None):
 							output,
 							next_refresh_at,
 							analysis_scroll=analysis_scroll,
+							force_analysis=force_analysis,
 						)
 						last_bar_text = None
 					elif scroll_delta:
@@ -1639,6 +1714,7 @@ def run_refresh_loop(args, output=None):
 							output=output,
 							next_refresh_at=next_refresh_at,
 							scroll=analysis_scroll,
+							allow_stale_lines=True,
 						)
 						analysis_scroll = min(analysis_scroll, analysis_max_scroll)
 						last_bar_text = None
@@ -1650,6 +1726,141 @@ def run_refresh_loop(args, output=None):
 				timer.cancel()
 
 			next_delay = REFRESH_SECONDS
+
+
+def _pid_file_path():
+	return BASE_DIR / PID_FILENAME
+
+
+def _read_pid_file():
+	try:
+		return int(_pid_file_path().read_text().strip())
+	except (OSError, ValueError):
+		return None
+
+
+def _pid_is_alive(pid):
+	try:
+		os.kill(pid, 0)
+	except ProcessLookupError:
+		return False
+	except PermissionError:
+		return True  # exists, just not ours to signal
+	return True
+
+
+def _process_command(pid):
+	try:
+		result = subprocess.run(
+			["ps", "-p", str(pid), "-o", "command="],
+			stdout=subprocess.PIPE,
+			stderr=subprocess.DEVNULL,
+			universal_newlines=True,
+			timeout=5,
+		)
+	except (OSError, subprocess.SubprocessError):
+		return ""
+	return result.stdout.strip()
+
+
+def find_existing_instance():
+	"""Return the PID of another running copy of this script, else ``None``.
+
+	The PID file alone is not trusted: PIDs get recycled, so the process must
+	also be alive *and* its command line must mention this script.
+	"""
+	pid = _read_pid_file()
+	if pid is None or pid == os.getpid() or not _pid_is_alive(pid):
+		return None
+	if Path(__file__).name not in _process_command(pid):
+		return None
+	return pid
+
+
+def release_pid_file():
+	if _read_pid_file() == os.getpid():
+		try:
+			_pid_file_path().unlink()
+		except OSError:
+			pass
+
+
+def _wait_for_exit(pid, timeout):
+	deadline = time.monotonic() + timeout
+	while time.monotonic() < deadline:
+		if not _pid_is_alive(pid):
+			return True
+		time.sleep(0.1)
+	return not _pid_is_alive(pid)
+
+
+def _ask_yes_no(question, input_fn=input):
+	try:
+		return input_fn(f"{question} [y/N] ").strip().lower() in {"y", "yes"}
+	except (EOFError, KeyboardInterrupt):
+		return False
+
+
+def terminate_existing_instance(pid, approved=False, interactive=True, input_fn=input, output=None):
+	"""Stop *pid*, asking before each step that gets more forceful.
+
+	1. SIGTERM (the instance's handler lets it restore its terminal) — asked
+	   first unless *approved* (``--kill-existing``).
+	2. SIGKILL only if it ignored SIGTERM, and **always** after an explicit
+	   yes: it skips the target's cleanup, so it is never pre-approved.
+	Returns True once the process is gone.
+	"""
+	output = output or sys.stdout
+
+	def say(text):
+		print(text, file=output)
+
+	if not approved:
+		if not interactive or not _ask_yes_no("Terminate it with SIGTERM?", input_fn):
+			return False
+	try:
+		os.kill(pid, signal.SIGTERM)
+	except ProcessLookupError:
+		return True
+	except PermissionError:
+		say(f"Not allowed to signal PID {pid} (owned by another user).")
+		return False
+	say(f"Sent SIGTERM to PID {pid}, waiting up to {TERMINATE_GRACE_SECONDS:g}s...")
+	if _wait_for_exit(pid, TERMINATE_GRACE_SECONDS):
+		return True
+
+	say(f"PID {pid} ignored SIGTERM.")
+	if not interactive or not _ask_yes_no("Escalate to SIGKILL (immediate, no cleanup)?", input_fn):
+		return False
+	try:
+		os.kill(pid, signal.SIGKILL)
+	except ProcessLookupError:
+		return True
+	except PermissionError:
+		say(f"Not allowed to signal PID {pid} (owned by another user).")
+		return False
+	return _wait_for_exit(pid, KILL_GRACE_SECONDS)
+
+
+def claim_single_instance(kill_existing=False, input_fn=input, interactive=None, output=None):
+	"""Record this process as the running instance; deal with any previous one."""
+	output = output or sys.stdout
+	if interactive is None:
+		interactive = sys.stdin.isatty()
+	existing = find_existing_instance()
+	if existing is not None:
+		print(f"Another AmerenRates instance is already running (PID {existing}).", file=output)
+		if not terminate_existing_instance(
+			existing, approved=kill_existing, interactive=interactive, input_fn=input_fn, output=output
+		):
+			print("Leaving it running; exiting. (Use --kill-existing to terminate it.)", file=output)
+			return False
+		print(f"PID {existing} is gone.", file=output)
+	try:
+		_pid_file_path().write_text(f"{os.getpid()}\n")
+	except OSError:
+		pass  # the guard is best-effort; never block the display over it
+	return True
 
 
 def parse_args(argv=None):
@@ -1670,6 +1881,12 @@ def parse_args(argv=None):
 		action="store_true",
 		help="Disable all AI analysis and hide AI controls.",
 	)
+	parser.add_argument(
+		"--kill-existing",
+		action="store_true",
+		help="If another instance is running, terminate it with SIGTERM without asking "
+		"(SIGKILL is still only sent after you confirm).",
+	)
 	return parser.parse_args(argv)
 
 
@@ -1678,7 +1895,14 @@ def main(argv=None):
 	if args.once:
 		render_screen(bar=args.bar, start_analysis=False, ai_enabled=not args.noai)
 		return
-	run_refresh_loop(args)
+	if not claim_single_instance(kill_existing=args.kill_existing):
+		sys.exit(1)
+	# Turn SIGTERM into a normal exit so terminal_key_reader restores the tty.
+	signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(0))
+	try:
+		run_refresh_loop(args)
+	finally:
+		release_pid_file()
 
 
 if __name__ == "__main__":

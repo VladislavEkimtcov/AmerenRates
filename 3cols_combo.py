@@ -13,20 +13,26 @@ import json
 import math
 import os
 import re
-import select
 import shutil
 import signal
 import subprocess
 import sys
-import termios
 import textwrap
 import threading
 import time
-import tty
 from datetime import datetime, timedelta
 from pathlib import Path
 
 import requests
+
+IS_WINDOWS = os.name == "nt"
+if IS_WINDOWS:
+	import ctypes
+	import msvcrt
+else:
+	import select
+	import termios
+	import tty
 
 from hour_utils import detect_hour_offset, normalize_hour, hour_to_time, shift_hours_if_last_zero
 from ptc_pull import PTC_FAILURE_VALUE, get_cached_price_to_compare
@@ -1511,6 +1517,30 @@ def _split_keys(buffer):
 	return keys, ""
 
 
+# msvcrt hands arrow/page keys over as a prefix char plus a scan code.
+_WINDOWS_KEY_SEQUENCES = {"H": "\x1b[A", "P": "\x1b[B", "I": "\x1b[5~", "Q": "\x1b[6~"}
+
+
+def _enable_windows_ansi():
+	"""Switch the console to interpret ANSI escapes; legacy consoles ignore them otherwise."""
+	kernel32 = ctypes.windll.kernel32
+	handle = kernel32.GetStdHandle(-11)  # STD_OUTPUT_HANDLE
+	mode = ctypes.c_ulong()
+	if kernel32.GetConsoleMode(handle, ctypes.byref(mode)):
+		kernel32.SetConsoleMode(handle, mode.value | 0x0004)  # ENABLE_VIRTUAL_TERMINAL_PROCESSING
+
+
+def _windows_read_available():
+	chars = []
+	while msvcrt.kbhit():
+		char = msvcrt.getwch()
+		if char in ("\x00", "\xe0"):
+			chars.append(_WINDOWS_KEY_SEQUENCES.get(msvcrt.getwch(), ""))
+		else:
+			chars.append(char)
+	return "".join(chars)
+
+
 @contextmanager
 def terminal_key_reader(input_stream=None):
 	input_stream = input_stream or sys.stdin
@@ -1522,9 +1552,12 @@ def terminal_key_reader(input_stream=None):
 		yield no_keys
 		return
 
-	fd = input_stream.fileno()
-	old_settings = termios.tcgetattr(fd)
-	tty.setcbreak(fd)
+	if IS_WINDOWS:
+		_enable_windows_ansi()
+	else:
+		fd = input_stream.fileno()
+		old_settings = termios.tcgetattr(fd)
+		tty.setcbreak(fd)
 	# The alternate screen is what makes macOS terminals hand us the scroll
 	# wheel as ↑/↓ presses (with trackpad momentum) rather than nothing at all.
 	# Mouse reporting stays off on purpose — see the note by MOUSE_DISABLE.
@@ -1541,6 +1574,19 @@ def terminal_key_reader(input_stream=None):
 			once per key and falling behind the input queue.
 			"""
 			nonlocal pending
+			if IS_WINDOWS:
+				deadline = time.monotonic() + timeout
+				buffer = _windows_read_available()
+				while not buffer and not pending and time.monotonic() < deadline:
+					time.sleep(0.01)
+					buffer = _windows_read_available()
+				if not buffer and not pending:
+					return []
+				buffer = pending + buffer
+				pending = ""
+				keys, pending = _split_keys(buffer)
+				return keys
+
 			ready, _, _ = select.select([input_stream], [], [], timeout)
 			if not ready and not pending:
 				return []
@@ -1561,7 +1607,8 @@ def terminal_key_reader(input_stream=None):
 	finally:
 		sys.stdout.write(f"{SHOW_CURSOR}{EXIT_ALT_SCROLL}{EXIT_ALT_SCREEN}")
 		sys.stdout.flush()
-		termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
+		if not IS_WINDOWS:
+			termios.tcsetattr(fd, termios.TCSADRAIN, old_settings)
 
 
 def _refresh_screen(screen_mode, rate_view, args, output, next_refresh_at, analysis_scroll=0, force_analysis=False):
@@ -1740,6 +1787,18 @@ def _read_pid_file():
 
 
 def _pid_is_alive(pid):
+	if IS_WINDOWS:
+		# os.kill(pid, 0) terminates the target on Windows, so ask the OS instead.
+		kernel32 = ctypes.windll.kernel32
+		handle = kernel32.OpenProcess(0x1000, False, pid)  # PROCESS_QUERY_LIMITED_INFORMATION
+		if not handle:
+			return kernel32.GetLastError() == 5  # access denied: exists, not ours
+		try:
+			exit_code = ctypes.c_ulong()
+			still_active = 259
+			return bool(kernel32.GetExitCodeProcess(handle, ctypes.byref(exit_code))) and exit_code.value == still_active
+		finally:
+			kernel32.CloseHandle(handle)
 	try:
 		os.kill(pid, 0)
 	except ProcessLookupError:
@@ -1750,9 +1809,14 @@ def _pid_is_alive(pid):
 
 
 def _process_command(pid):
+	if IS_WINDOWS:
+		query = f"(Get-CimInstance Win32_Process -Filter 'ProcessId={int(pid)}').CommandLine"
+		command = ["powershell", "-NoProfile", "-Command", query]
+	else:
+		command = ["ps", "-p", str(pid), "-o", "command="]
 	try:
 		result = subprocess.run(
-			["ps", "-p", str(pid), "-o", "command="],
+			command,
 			stdout=subprocess.PIPE,
 			stderr=subprocess.DEVNULL,
 			universal_newlines=True,
@@ -1833,7 +1897,7 @@ def terminate_existing_instance(pid, approved=False, interactive=True, input_fn=
 	if not interactive or not _ask_yes_no("Escalate to SIGKILL (immediate, no cleanup)?", input_fn):
 		return False
 	try:
-		os.kill(pid, signal.SIGKILL)
+		os.kill(pid, getattr(signal, "SIGKILL", signal.SIGTERM))
 	except ProcessLookupError:
 		return True
 	except PermissionError:

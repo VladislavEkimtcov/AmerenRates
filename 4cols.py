@@ -14,7 +14,7 @@ RESET = '\033[0m'
 
 def hour_to_time(hour_str):
     hour = int(hour_str) - 1  # shift because "01" is 00:00
-    time_obj = (datetime.min + timedelta(hours=hour)).strftime("%-I:%M %p")
+    time_obj = (datetime.min + timedelta(hours=hour)).strftime("%I:%M %p").lstrip("0")
     return time_obj
 
 def colorize_price(price, thresholds):

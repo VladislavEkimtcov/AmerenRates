@@ -27,7 +27,8 @@ def normalize_hour(hour_str, offset=0):
 
 def hour_to_time(hour_str, offset=0):
     hour = normalize_hour(hour_str, offset)
-    time_obj = (datetime.min + timedelta(hours=hour)).strftime("%-I:%M")
+    # "%-I" is glibc-only (fails on Windows), so strip the zero padding by hand.
+    time_obj = (datetime.min + timedelta(hours=hour)).strftime("%I:%M").lstrip("0")
     return time_obj
 
 
